@@ -1,4 +1,3 @@
-
 import os
 import sys
 import math
@@ -34,13 +33,25 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
-
+from accelerate import DistributedDataParallelKwargs as DDPK
 
 from model.fusion import ObjectFusionTokenizer
 from model.cond_vae import SceneVAEModel
 from model.attention import register_attention_control
 from data import build_train_dataloader
 from loss import VaeGaussCriterion, BoxL1Criterion, BoxRepelLoss
+from torch.utils.data import DataLoader, SequentialSampler
+from torchvision.utils import make_grid
+from torch.utils.tensorboard import SummaryWriter
+import gc, torch, numpy as np, os, sys
+from tqdm import tqdm
+from PIL import Image
+import torch.distributed as dist
+
+os.environ["NCCL_TIMEOUT"]="10800"
+os.environ["NCCL_BLOCKING_WAIT"]="1"
+os.environ["NCCL_ASYNC_ERROR_HANDLING"]="1"
+os.environ["TORCH_DISTRIBUTED_TIMEOUT"]="10800"
 
 #accelerate launch train_disco.py --use_ema --resolution=512 --batch_size=1 --gradient_accumulation_steps=4 --gradient_checkpointing --max_train_steps=50000 --learning_rate=1e-05  --lr_scheduler="linear" --checkpointing_steps 5000
 def parse_args():
@@ -50,20 +61,20 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default="/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/yeziqi-240108100047/yxy_SG2I/results/", help='path to save checkpoint')
     parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard log directory.")
 
-    parser.add_argument('--dataloader_num_workers', type=int, default=4, help='num_workers') #8
+    parser.add_argument('--dataloader_num_workers', type=int, default=8, help='num_workers') #8
     parser.add_argument('--dataloader_shuffle', type=bool, default=True, help='shuffle')
     parser.add_argument("--tracker_project_name", type=str, default="sg2i", help="The `project_name` passed to Accelerator",)
     parser.add_argument('--resolution', type=int, default=512, help='resolution')
-    parser.add_argument('--batch_size', type=int, default=8, help='batch size') #8
+    parser.add_argument('--batch_size', type=int, default=1, help='batch size') #8
     parser.add_argument("--num_train_epochs", type=int, default=200)
-    parser.add_argument("--max_train_steps", type=int, default=50000, help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",) # none
-    parser.add_argument("--checkpointing_steps", type=int, default=10000, help="Save a checkpoint of the training state every X updates.") #5000
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")
+    parser.add_argument("--max_train_steps", type=int, default=100, help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",) # none
+    parser.add_argument("--checkpointing_steps", type=int, default=10, help="Save a checkpoint of the training state every X updates.") #5000
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2, help="Number of updates steps to accumulate before performing a backward/update pass.")
     
     parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--allow_tf32", action="store_true", help="Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information")
-    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"], help="Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16)",)
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"], help="Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16)",) # no
     parser.add_argument("--gradient_checkpointing", action="store_true", help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.")
 
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Initial learning rate (after the potential warmup period) to use.") # 1e-4
@@ -101,11 +112,13 @@ class Trainer:
         self.logger = get_logger(__name__, log_level="INFO")
         logging_dir = os.path.join(args.output_dir, args.logging_dir)
         accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+        ddp_kwargs=DDPK(find_unused_parameters=True)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             mixed_precision=args.mixed_precision,
             log_with="tensorboard",
             project_config=accelerator_project_config,
+            kwargs_handlers=[ddp_kwargs],
         )
 
         # Make one log on every process with the configuration for debugging.
@@ -150,6 +163,9 @@ class Trainer:
             args.pretrained_diffusion_model_path, 
             subfolder="tokenizer"
         )
+        # 在 __init__ 里（主进程）准备一个 writer
+        if self.accelerator.is_main_process:
+            self.tb_writer = SummaryWriter(log_dir=os.path.join(self.args.output_dir, "tb_val"))
 
         def deepspeed_zero_init_disabled_context_manager():
             """
@@ -216,7 +232,7 @@ class Trainer:
                     if args.use_ema:
                         self.ema_unet.store(self.unet.parameters())
                         self.ema_unet.copy_to(self.unet.parameters())
-                        self.unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                        self.unet.module.save_pretrained(os.path.join(output_dir, "unet_ema"))
                         self.ema_unet.restore(self.unet.parameters())
 
                     for i, model in enumerate(models):
@@ -356,7 +372,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             tracker_config = dict(vars(args))
             self.accelerator.init_trackers(args.tracker_project_name, tracker_config)
-
+        
     def start(self):
         # Print information
         self.logger.info('  Global configuration as follows:')
@@ -426,9 +442,7 @@ class Trainer:
                 timesteps = timesteps.long()
 
                 mu, logvar, layout_pred, semantics_embs = self.sl_vae(objs, obj_clip_embs, layout, triples, rel_clip_embs)
-                # 用 GTlayout 改为用 layout_pred
-                # object_embeddings, meta_data = self.object_fusion_tokenizer(layout, semantics_embs.squeeze(0))
-                object_embeddings, meta_data = self.object_fusion_tokenizer(layout_pred, semantics_embs.squeeze(0))
+                object_embeddings, meta_data = self.object_fusion_tokenizer(layout, semantics_embs.squeeze(0))
 
                 cross_attention_kwargs={}
                 cross_attention_kwargs['object_embeddings']= object_embeddings
@@ -497,31 +511,37 @@ class Trainer:
                 logs = {"step_loss": '%.4f' % loss.detach().item(), "lr": '%.2e' % self.lr_scheduler.get_last_lr()[0]}
                 self.progress_bar.set_postfix(**logs)
 
-                if self.global_step % args.checkpointing_steps == 0:
-                    if self.accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{self.global_step}")
-                        self.accelerator.save_state(save_path)
-                        self.logger.info(f"Saved state to {save_path}")
+                
+            if self.global_step % args.checkpointing_steps == 0:
+                save_path = os.path.join(args.output_dir, f"checkpoint-{self.global_step}")
+                print(f"[Rank {self.accelerator.process_index}] before save_state")
+                # —— 每个 rank 都来一次，内部会同步
+                self.accelerator.save_state(save_path)
+                print(f"[Rank {self.accelerator.process_index}] after save_state")
 
-                        # Validation
-                        if self.args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            self.ema_unet.store(self.unet.parameters())
-                            self.ema_unet.copy_to(self.unet.parameters())
+                if self.accelerator.is_main_process:
+                    print("[Main] before EMA store/copy")
+                    if self.args.use_ema:
+                        self.ema_unet.store(self.unet.parameters())
+                        self.ema_unet.copy_to(self.unet.parameters())
 
-                        with torch.no_grad():
-                            # Validation
-                            text_encoder = self.accelerator.unwrap_model(self.text_encoder)
+                    self.logger.info(f"[Step {self.global_step}] Start validation")
+                    with torch.no_grad():
+                        self.log_validation(self.global_step)
+                    self.logger.info(f"[Step {self.global_step}] Validation finished")
 
-                            self.log_validation(self.global_step)
+                    if self.args.use_ema:
+                        self.ema_unet.restore(self.unet.parameters())
+                    print("[Main] after EMA restore")
 
-                        if self.args.use_ema:
-                            # Switch back to the original UNet parameters.
-                            self.ema_unet.restore(self.unet.parameters())
+                # 所有 rank 在这里再汇合一次，确保后续 step 大小一致
+                self.accelerator.wait_for_everyone()
 
+            print(f"[Rank {self.accelerator.process_index}] before next step")
+         
             if self.global_step >= args.max_train_steps:
                 break
-    
+            
     def gather_loss(self, loss):
         avg_loss = self.accelerator.gather(loss.repeat(args.batch_size)).mean()
         loss = avg_loss.item() / self.args.gradient_accumulation_steps
@@ -529,82 +549,102 @@ class Trainer:
             
     @torch.no_grad()
     def log_validation(self, epoch):
+        # 1) 只允许主进程进入
         if not self.accelerator.is_main_process:
-            return  # 只让主进程做验证，避免 DDP 多进程冲突
+            return
 
-        box_mean_est, box_cov_est = self.sl_vae.collect_data_statistics(self.train_dataloader, self.accelerator.device)
-        pbar = tqdm(self.val_dataloader, file=sys.stdout)
+        device = self.accelerator.device          # 简写
+        weight_dtype = self.weight_dtype
 
-        pil_images = []
+        # 2) 收集统计量
+        box_mean_est, box_cov_est = self.sl_vae.module.collect_data_statistics(
+            self.train_dataloader, device
+        )
+
+        # 3) **重新** 构造一个不含 DistributedSampler 的 dataloader
+        _, val_loader, _ = build_train_dataloader(args, tokenizer=self.tokenizer)
+        
+
+        # 4) 开始推理
         save_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.global_step}", "image_layout")
         os.makedirs(save_dir, exist_ok=True)
-        for idx, batch in enumerate(pbar):
-            imgs, objs, obj_clip_embs, boxes, triples, rel_clip_embs, obj_to_img, triple_to_img, img_paths, caption = batch
-            objs, triples = objs.to(self.accelerator.device), triples.to(self.accelerator.device)
-            obj_clip_embs, rel_clip_embs = obj_clip_embs.to(self.accelerator.device), rel_clip_embs.to(self.accelerator.device)
-            caption = caption.to(self.accelerator.device)
 
-            layout_preds, semantics_embs = self.sl_vae.sample(box_mean_est, box_cov_est, objs, obj_clip_embs, triples, rel_clip_embs, self.accelerator.device)
+        core_unet = self.accelerator.unwrap_model(self.unet)   # 取底层 UNet 一次即可
+        pil_images = []
+
+        for batch in tqdm(val_loader, file=sys.stdout, desc="val"):
+            imgs, objs, obj_clip_embs, boxes, triples, rel_clip_embs, \
+            obj_to_img, triple_to_img, img_paths, caption = batch
+
+            objs, triples = objs.to(device), triples.to(device)
+            obj_clip_embs, rel_clip_embs = obj_clip_embs.to(device), rel_clip_embs.to(device)
+            caption = caption.to(device)
+
+            # ---- VAE 采样 ----
+            layout_preds, semantics_embs = self.sl_vae.module.sample(
+                box_mean_est, box_cov_est, objs, obj_clip_embs,
+                triples, rel_clip_embs, device
+            )
             layout_image = self.layout_visualization(objs, layout_preds)
-            object_embeddings, meta_data = self.object_fusion_tokenizer(layout_preds, semantics_embs.squeeze(0))
 
+            # ---- 构造 cross-attention 关键字 ----
+            object_embeddings, meta_data = self.object_fusion_tokenizer(
+                layout_preds, semantics_embs.squeeze(0)
+            )
             cross_attention_kwargs = {
-                'object_embeddings': torch.cat([object_embeddings, object_embeddings]),
-                'object_attention_masks': torch.cat([
-                    meta_data['object_attention_masks'],
-                    meta_data['object_attention_masks']
-                ])
+                "object_embeddings": torch.cat([object_embeddings, object_embeddings]),
+                "object_attention_masks": torch.cat([
+                    meta_data["object_attention_masks"],
+                    meta_data["object_attention_masks"],
+                ]),
             }
 
+            # ---- 文本&噪声准备 ----
             cond_embeddings = self.text_encoder(caption)[0]
-
-            max_length = caption.shape[-1]
-            uncond_input = self.tokenizer(
-                [""], padding="max_length", max_length=max_length, return_tensors="pt"
-            )
-            uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.accelerator.device))[0]
-
+            max_len = caption.shape[-1]
+            uncond_input = self.tokenizer([""], padding="max_length",
+                                        max_length=max_len, return_tensors="pt")
+            uncond_embeddings = self.text_encoder(
+                uncond_input.input_ids.to(device))[0]
             text_embeddings = torch.cat([uncond_embeddings, cond_embeddings])
 
             self.scheduler.set_timesteps(self.args.num_inference_steps)
-            latent_size = (1, self.unet.config.in_channels, self.args.resolution // 8, self.args.resolution // 8)
-            #latent = torch.randn(latent_size, generator=torch.manual_seed(self.args.seed), device=self.accelerator.device)
-            gen = torch.Generator(device=self.accelerator.device)
-            gen.manual_seed(self.args.seed)
-            latent = torch.randn(latent_size, generator=gen, device=self.accelerator.device)
-
+            latent_size = (1, core_unet.config.in_channels,
+                        self.args.resolution // 8, self.args.resolution // 8)
+            latent = torch.randn(latent_size, generator=torch.Generator(device=device)
+                                .manual_seed(self.args.seed), device=device)
             latent = latent * self.scheduler.init_noise_sigma
 
+            # ---- DDIM / PNDM 反向推理 ----
             for t in self.scheduler.timesteps:
-                latent_model_input = torch.cat([latent] * 2)
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep=t)
+                latent_in = torch.cat([latent] * 2)
+                latent_in = self.scheduler.scale_model_input(latent_in, t)
 
-                noise_pred = self.unet(latent_model_input, t, text_embeddings, cross_attention_kwargs=cross_attention_kwargs).sample
-                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.args.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-
+                noise_pred = core_unet(latent_in, t, text_embeddings,
+                                    cross_attention_kwargs=cross_attention_kwargs).sample
+                noise_uncond, noise_cond = noise_pred.chunk(2)
+                noise_pred = noise_uncond + self.args.guidance_scale * (noise_cond - noise_uncond)
                 latent = self.scheduler.step(noise_pred, t, latent).prev_sample
 
-            scaled_latents = 1.0 / 0.18215 * latent.clone()
-            image = self.vae.decode(scaled_latents.to(self.weight_dtype)).sample
+            # ---- 解码 & 可视化 ----
+            image = self.vae.decode((latent / 0.18215).to(weight_dtype)).sample
             image = (image / 2 + 0.5).clamp(0, 1)
-            image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
-            image = (image * 255).round().astype("uint8")
+            image = image.cpu().permute(0, 2, 3, 1).numpy() * 255
+            image = image.round().astype(np.uint8)
 
-            grid = Image.new('RGB', size=(self.args.resolution * 2, self.args.resolution))
-            grid.paste(Image.fromarray(image.squeeze(0)), box=(0, 0))
-            grid.paste(layout_image, box=(self.args.resolution, 0))
+            grid = Image.new("RGB", (self.args.resolution * 2, self.args.resolution))
+            grid.paste(Image.fromarray(image.squeeze(0)), (0, 0))
+            grid.paste(layout_image, (self.args.resolution, 0))
             pil_images.append(grid)
-            # 保存图像到 save_dir
-            for i, (img_path, pil_image) in enumerate(zip(img_paths, [grid])):
-                img_name = os.path.splitext(os.path.basename(img_path))[0] + ".png"
-                save_path = os.path.join(save_dir, img_name)
-                pil_image.save(save_path)
-            
-        # 写入 TensorBoard / WandB
-        for tracker in self.accelerator.trackers:
-            np_images = np.stack([np.asarray(img) for img in pil_images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+
+            img_name = os.path.splitext(os.path.basename(img_paths[0]))[0] + ".png"
+            grid.save(os.path.join(save_dir, img_name))
+
+        # 5) 写入 TensorBoard（只主进程）
+        np_imgs = np.stack([np.asarray(img) for img in pil_images])
+        self.tb_writer.add_images("validation", np_imgs, epoch, dataformats="NHWC")
+        self.tb_writer.flush()
+
     
     # @torch.no_grad()
     # def log_validation(self, epoch):
@@ -677,25 +717,7 @@ class Trainer:
     #     for tracker in self.accelerator.trackers:
     #         np_images = np.stack([np.asarray(img) for img in pil_images])
     #         tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-
-
-    # def layout_visualization(self, objs, boxes, images=None):
-    #     color = list(np.random.choice(range(256), size=(len(boxes), 3)))
-    #     if images == None:
-    #         layout = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
-    #     draw_layout = ImageDraw.Draw(layout)
-
-    #     for i, (obj, box) in enumerate(zip(objs, boxes)):
-    #         obj_text = self.vocab['object_idx_to_name'][obj]
-    #         box = box * self.args.resolution
-    #         x0, y0, x1, y1 = box
-    #         if x1 < x0 or y1 < y0:
-    #             break
-    #         draw_layout.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
-    #         draw_layout.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
-        
-    #     return layout
-    
+ 
     def layout_visualization(self, objs, boxes, images=None):
         if images is None:
             layout = Image.new("RGB", size=(self.args.resolution, self.args.resolution), color=(255, 255, 255))

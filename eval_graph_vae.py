@@ -4,7 +4,7 @@ import math
 import pickle
 from tqdm import tqdm
 from PIL import Image, ImageDraw, ImageFont
-
+import cv2
 import torch
 import numpy as np
 from transformers import get_scheduler
@@ -69,32 +69,72 @@ class Evaluator(object):
                 boxes = boxes.cpu().detach().numpy()
                 self.save_sample(objs, box_preds, boxes, img_paths[0])
 
+    # def save_sample(self, objs, boxes_pred, boxes_gt, img_paths):
+    #     name = os.path.basename(img_paths)
+    #     save_path = os.path.join(self.save_path, name)
+    #     color = list(np.random.choice(range(256), size=(len(boxes_pred), 3)))
+
+    #     layout_pred = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
+    #     draw_pred = ImageDraw.Draw(layout_pred)
+    #     for i, (obj, box_pred) in enumerate(zip(objs, boxes_pred)):
+    #         obj_text = self.vocab['object_idx_to_name'][obj]
+    #         box_pred = box_pred * self.args.resolution
+    #         x0, y0, x1, y1 = box_pred 
+    #         if x1 < x0 or y1 < y0:
+    #             break
+    #         draw_pred.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
+    #         draw_pred.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
+        
+    #     layout_gt = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
+    #     draw_gt = ImageDraw.Draw(layout_gt)
+    #     for i, (obj, box_gt) in enumerate(zip(objs, boxes_gt)):
+    #         obj_text = self.vocab['object_idx_to_name'][obj]
+    #         box_gt = box_gt * self.args.resolution
+    #         x0, y0, x1, y1 = box_gt 
+    #         draw_gt.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
+    #         draw_gt.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
+        
+    #     layout = Image.new('RGB', size=(self.args.resolution + self.args.resolution, self.args.resolution))
+    #     layout.paste(layout_gt, (0, 0))
+    #     layout.paste(layout_pred, (self.args.resolution, 0))
+    #     layout.save(save_path)
     def save_sample(self, objs, boxes_pred, boxes_gt, img_paths):
         name = os.path.basename(img_paths)
         save_path = os.path.join(self.save_path, name)
-        color = list(np.random.choice(range(256), size=(len(boxes_pred), 3)))
+        color = list(np.random.randint(0, 256, size=(len(boxes_pred), 3)))
 
-        layout_pred = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
+        layout_pred = Image.new('RGB', size=(self.args.resolution, self.args.resolution))
         draw_pred = ImageDraw.Draw(layout_pred)
         for i, (obj, box_pred) in enumerate(zip(objs, boxes_pred)):
             obj_text = self.vocab['object_idx_to_name'][obj]
-            box_pred = box_pred * self.args.resolution
-            x0, y0, x1, y1 = box_pred 
-            if x1 < x0 or y1 < y0:
-                break
-            draw_pred.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
-            draw_pred.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
-        
-        layout_gt = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
+            #cx, cy, w, h, angle = (box_pred * self.args.resolution).tolist()
+            cx, cy, w, h, cos_theta, sin_theta = (box_pred * self.args.resolution).tolist()
+            angle = math.atan2(sin_theta, cos_theta)
+            angle_deg = angle * 180.0 / np.pi
+
+            rect = ((cx, cy), (w, h), angle_deg)
+            points = cv2.boxPoints(rect)  # shape: (4,2)
+            points = [tuple(p) for p in points]
+
+            draw_pred.polygon(points, outline=tuple(color[i]))
+            draw_pred.text((cx, cy), obj_text, fill=tuple(color[i]))
+
+        layout_gt = Image.new('RGB', size=(self.args.resolution, self.args.resolution))
         draw_gt = ImageDraw.Draw(layout_gt)
         for i, (obj, box_gt) in enumerate(zip(objs, boxes_gt)):
             obj_text = self.vocab['object_idx_to_name'][obj]
-            box_gt = box_gt * self.args.resolution
-            x0, y0, x1, y1 = box_gt 
-            draw_gt.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
-            draw_gt.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
-        
-        layout = Image.new('RGB', size=(self.args.resolution + self.args.resolution, self.args.resolution))
+            cx, cy, w, h, angle = (box_gt * self.args.resolution).tolist()
+            angle_deg = angle * 180.0 / np.pi
+
+            rect = ((cx, cy), (w, h), angle_deg)
+            points = cv2.boxPoints(rect)
+            points = [tuple(p) for p in points]
+
+            draw_gt.polygon(points, outline=tuple(color[i]))
+            draw_gt.text((cx, cy), obj_text, fill=tuple(color[i]))
+
+        layout = Image.new('RGB', size=(self.args.resolution * 2, self.args.resolution))
         layout.paste(layout_gt, (0, 0))
         layout.paste(layout_pred, (self.args.resolution, 0))
         layout.save(save_path)
+

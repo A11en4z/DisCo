@@ -22,34 +22,34 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from eval_graph_vae import Evaluator
+from eval.eval_graph_vae import Evaluator
 from model.box_vae import SceneVAEModel
 from data import build_train_dataloader
-from loss import VaeGaussCriterion, BoxL1Criterion
+from loss import VaeGaussCriterion, BoxL1Criterion, BoxRepelLoss
 
 # accelerate launch train_graph_vae.py --lr_scheduler 'linear' --checkpointing_steps=10000 --batch_size 64
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/model/wangyunnan/StableDiffusion/stable-diffusion-v1-5', help="Path to pretrained model or model identifier from huggingface.co/models.",)
-    parser.add_argument('--data_dir', type=str, default='/data/wangyunnan/VisualGenome', help='path to training dataset')
-    parser.add_argument('--output_dir', type=str, default="./results", help='path to save checkpoint')
+    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/yeziqi-240108100047/yxy_SG2I/stable-diffusion-v1-5/', help="Path to pretrained model or model identifier from huggingface.co/models.",)
+    parser.add_argument('--data_dir', type=str, default='/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/yeziqi-240108100047/yxy_SG2I/vg/', help='path to training dataset')
+    parser.add_argument('--output_dir', type=str, default="/inspire/hdd/ws-f4d69b29-e0a5-44e6-bd92-acf4de9990f0/public-project/yeziqi-240108100047/yxy_SG2I/results/", help='path to save checkpoint')
     parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard log directory.")
     
-    parser.add_argument('--dataloader_num_workers', type=int, default=8, help='num_workers')
+    parser.add_argument('--dataloader_num_workers', type=int, default=32, help='num_workers') # 8 # 32
     parser.add_argument('--dataloader_shuffle', type=bool, default=True, help='shuffle')
     parser.add_argument("--tracker_project_name", type=str, default="vae_box", help="The `project_name` passed to Accelerator",)
     parser.add_argument('--resolution', type=int, default=512, help='resolution')
-    parser.add_argument('--batch_size', type=int, default=8, help='batch size')
-    parser.add_argument("--num_train_epochs", type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=8, help='batch size') # 8
+    parser.add_argument("--num_train_epochs", type=int, default= 200) 
     parser.add_argument("--max_train_steps", type=int, default=None, help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",)
     parser.add_argument("--checkpointing_steps", type=int, default=5000, help="Save a checkpoint of the training state every X updates.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")
     
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"], help="Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16)",)
     parser.add_argument("--allow_tf32", action="store_true", help="Whether or not to allow TF32 on Ampere GPUs. Can be used to speed up training. For more information")
 
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate (after the potential warmup period) to use.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Initial learning rate (after the potential warmup period) to use.") # 1e-4
     parser.add_argument("--lr_scheduler", type=str, default="constant", help='The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]')
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler.")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -57,8 +57,10 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--vae_loss_weight", type=float, default=0.1, help="")
+    parser.add_argument("--vae_loss_weight", type=float, default=0.1, help="") # default 0.1
     parser.add_argument("--box_loss_weight", type=float, default=1, help="")
+    parser.add_argument("--box_repel_loss_weight", type=float, default=1, help="") # 惩罚框重叠
+    parser.add_argument("--layout_uniform_loss_weight", type=float, default=0.1, help="") # 促进布局均匀
     parser.add_argument('--embedding_dim', type=int, default=64, help='embedding dim of GCN')
 
     args = parser.parse_args()
@@ -123,7 +125,8 @@ class Trainer:
 
         # Criterion
         self.vae_gauss_criterion = VaeGaussCriterion()
-        self.box_l1_criterion = BoxL1Criterion()
+        self.box_l1_criterion = BoxL1Criterion(angle_weight=1.0)
+        self.box_repel_loss = BoxRepelLoss(repel_margin=0.05, min_size=0.02, size_weight=1.0)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -204,6 +207,8 @@ class Trainer:
         self.logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
         self.logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
         self.logger.info(f"  Total optimization steps = {self.args.max_train_steps}")
+        self.logger.info(f"  Using device = {self.accelerator.device}")
+
         
         self.train()
 
@@ -242,11 +247,13 @@ class Trainer:
                 # Compute loss
                 box_loss = self.box_l1_criterion(box_pred, boxes)
                 vae_loss = self.vae_gauss_criterion(mu, logvar)
-                loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight
+                overlap_loss = self.box_repel_loss(box_pred)
+                loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + self.args.box_repel_loss_weight * overlap_loss
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 log_box_loss = self.gather_loss(box_loss)
                 log_vae_loss = self.gather_loss(vae_loss)
+                log_overlap_loss = self.gather_loss(overlap_loss)
                 log_loss = self.gather_loss(loss)
 
                 # Backpropagate
@@ -265,6 +272,7 @@ class Trainer:
 
                 self.accelerator.log({"box_loss": log_box_loss}, step=self.global_step)
                 self.accelerator.log({"vae_loss": log_vae_loss}, step=self.global_step)
+                self.accelerator.log({"overlap_loss": log_overlap_loss}, step=self.global_step)
                 self.accelerator.log({"train_loss": log_loss}, step=self.global_step)
                 self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]}, step=self.global_step)
 
