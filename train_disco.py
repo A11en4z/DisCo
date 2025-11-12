@@ -622,21 +622,12 @@ class Trainer:
                 draw_layout.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
             elif len(box) == 5:
                 cx, cy, w, h, a = box
-                # 只缩放位置信息
                 cx, cy, w, h = cx * self.args.resolution, cy * self.args.resolution, w * self.args.resolution, h * self.args.resolution
-                # 角度优先认为是弧度；如遇到 [0,1] 则映射到 [-π, π]
-                theta = a
-                if 0.0 <= a <= 1.0:
-                    theta = (a - 0.5) * 2 * np.pi
-    
+                theta = a if not (0.0 <= a <= 1.0) else (a - 0.5) * 2 * np.pi
                 dx, dy = w / 2.0, h / 2.0
                 cos_t, sin_t = np.cos(theta), np.sin(theta)
                 corners = [(-dx, -dy), (-dx,  dy), ( dx,  dy), ( dx, -dy)]
-                points = []
-                for px, py in corners:
-                    x = cx + cos_t * px - sin_t * py
-                    y = cy + sin_t * px + cos_t * py
-                    points.append((x, y))
+                points = [(cx + cos_t*px - sin_t*py, cy + sin_t*px + cos_t*py) for px, py in corners]
                 draw_layout.polygon(points, outline=tuple(color[i]))
                 draw_layout.text(xy=(cx, cy), text=obj_text, fill=tuple(color[i]))
         
