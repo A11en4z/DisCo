@@ -16,10 +16,33 @@ class VaeGaussCriterion(nn.Module):
             return 0
         return loss
     
+# class BoxL1Criterion(nn.Module):
+#     def __init__(self):
+#         super(BoxL1Criterion, self).__init__()
+
+#     def forward(self, pred, target):
+#         loss = F.l1_loss(pred, target)
+#         return loss
+    
 class BoxL1Criterion(nn.Module):
-    def __init__(self):
+    def __init__(self, angle_weight=1.0):
         super(BoxL1Criterion, self).__init__()
+        self.angle_weight = angle_weight
 
     def forward(self, pred, target):
-        loss = F.l1_loss(pred, target)
-        return loss
+        # Split位置参数 & 角度
+        pred_box = pred[..., :4]
+        target_box = target[..., :4]
+
+        pred_angle = pred[..., 4]
+        target_angle = target[..., 4]
+
+        # 位置 + 尺寸 L1
+        loc_loss = F.l1_loss(pred_box, target_box)
+
+        # 角度周期 loss（平滑 + 可导）
+        angle_diff = pred_angle - target_angle
+        angle_loss = torch.mean(1 - torch.cos(angle_diff))  # ∈ [0, 2]
+
+        # 总损失
+        return loc_loss + self.angle_weight * angle_loss

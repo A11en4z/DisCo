@@ -14,21 +14,17 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 class VisualGenomeDataset(Dataset):
-    def __init__(self, args, vocab, mode, tokenizer=None, with_clip_embs=True):
+    def __init__(self, args, vocab, mode, tokenizer=None):
         super(VisualGenomeDataset, self).__init__()
         assert mode in ["train", "val", "test"]
 
         self.mode = mode
         self.image_dir = os.path.join(args.data_dir, 'images')
         self.resolution = args.resolution
-        self.h5_path = os.path.join(args.data_dir, 'labels', f'{self.mode}.h5')
-        self.h5_file = h5py.File(self.h5_path, 'r')
 
         self.vocab = vocab
         self.tokenizer = tokenizer
         self.num_objects = len(self.vocab['object_idx_to_name'])
-
-        self.with_clip_embs = with_clip_embs
 
         self.labels = {}
         self.image_paths = []
@@ -54,30 +50,14 @@ class VisualGenomeDataset(Dataset):
         image_path = self.image_paths[index].decode("utf-8")
         image_path = os.path.join(self.image_dir, image_path)
 
-        raw_path = self.h5_file['image_paths'][index].decode("utf-8")
-        fname = os.path.basename(raw_path)
-        image_path = os.path.join(self.image_dir, fname)
-        
         image = Image.open(image_path).convert("RGB")
         WW, HH = image.size
         image = self.image_transforms(image)
+        clip_embs =  pickle.load(open(image_path.replace('images', 'clip').replace('.jpg', '.pkl'), 'rb'))
+        clip_obj_embs = torch.from_numpy(clip_embs['objects'])
+        clip_rel_embs = torch.from_numpy(clip_embs['relations'])
 
-        # clip_embs =  pickle.load(open(image_path.replace('images', 'clip').replace('.jpg', '.pkl'), 'rb'))
-        # clip_obj_embs = torch.from_numpy(clip_embs['objects'])
-        # clip_rel_embs = torch.from_numpy(clip_embs['relations'])
-        clip_obj_embs, clip_rel_embs = None, None
-        if self.with_clip_embs:
-            try:
-                clip_dir = os.path.join(os.path.dirname(self.image_dir), 'clip')
-                #clip_path = image_path.replace('images', 'clip').replace('.png', '.pkl')
-                clip_path = os.path.join(clip_dir, os.path.splitext(fname)[0] + '.pkl')
-                clip_embs = pickle.load(open(clip_path, 'rb'))
-                clip_obj_embs = torch.from_numpy(clip_embs['objects'])
-                clip_rel_embs = torch.from_numpy(clip_embs['relations'])
-            except FileNotFoundError:
-                print(f"[Warning] Missing clip_embs: {clip_path}")
-                return None  # 让collate_fn过滤掉
-
+        
         # Figure out which objects appear in relationships and which don't
         obj_idxs_with_rels = set()
         obj_idxs_without_rels = set(range(self.labels['objects_per_image'][index].item()))
@@ -162,43 +142,6 @@ class VisualGenomeDataset(Dataset):
         return image, objs, clip_obj_embs, boxes, triples, clip_rel_embs, image_path, caption
     
 
-    
-# def collate_fn_graph_batch(batch):
-#     batch = [b for b in batch if b is not None]
-
-#     # 如果 clip 特征是 None，直接跳过（用于构造阶段）
-#     if isinstance(batch[0][2], type(None)):  # b[2] 是 clip_obj_embs
-#         all_imgs, all_objs, all_boxes, all_triples, all_obj_to_img, all_triple_to_img, all_img_paths, all_captions = [], [], [], [], [], [], [], []
-#         obj_offset = 0
-#         for i, (img, objs, _, boxes, triples, _, img_path, caption) in enumerate(batch):
-#             num_objs, num_triples = objs.size(0), triples.size(0)
-#             triples = triples.clone()
-#             triples[:, 0] += obj_offset
-#             triples[:, 2] += obj_offset
-#             obj_offset += num_objs
-
-#             all_imgs.append(img[None])
-#             all_objs.append(objs)
-#             all_boxes.append(boxes)
-#             all_triples.append(triples)
-#             all_obj_to_img.append(torch.LongTensor(num_objs).fill_(i))
-#             all_triple_to_img.append(torch.LongTensor(num_triples).fill_(i))
-#             all_img_paths.append(img_path)
-#             all_captions.append(caption)
-
-#         return (
-#             torch.cat(all_imgs),
-#             torch.cat(all_objs),
-#             None,
-#             torch.cat(all_boxes),
-#             torch.cat(all_triples),
-#             None,
-#             torch.cat(all_obj_to_img),
-#             torch.cat(all_triple_to_img),
-#             all_img_paths,
-#             torch.cat(all_captions),
-#         )
-
 def collate_fn_graph_batch(batch):
   """
   Collate function to be used when wrapping a VisualGenomeDataset in a
@@ -215,7 +158,6 @@ def collate_fn_graph_batch(batch):
     triple_to_img[t] = n means that triples[t] belongs to imgs[n]
   - imgs_masked: FloatTensor of shape (N, 4, H, W)
   """
-  # construct_textual_graph首次构造clip嵌入时，注释了下面emb的读取防止循环依赖问题，现在已恢复。
   # batch is a list, and each element is (image, objs, boxes, triples)
   all_imgs, all_objs, all_clip_obj_embs, all_boxes, all_triples, all_clip_rel_embs, all_img_paths, all_captions = [], [], [], [], [], [], [], []
   all_obj_to_img, all_triple_to_img = [], []
@@ -265,12 +207,12 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def build_train_dataloader(args, tokenizer=None, with_clip_embs=True):
+def build_train_dataloader(args, tokenizer=None):
 
     with open(os.path.join(args.data_dir, 'vocab.json'), 'r') as f:
         vocab = json.load(f)
 
-    train_dataset = VisualGenomeDataset(args, vocab=vocab, mode='train', tokenizer=tokenizer, with_clip_embs=with_clip_embs)
+    train_dataset = VisualGenomeDataset(args, vocab=vocab, mode='train', tokenizer=tokenizer)
     iter_per_epoch = len(train_dataset) // args.batch_size
 
     train_dataloader = DataLoader(
@@ -281,7 +223,7 @@ def build_train_dataloader(args, tokenizer=None, with_clip_embs=True):
         collate_fn=collate_fn_graph_batch
     )
 
-    val_dataset = VisualGenomeDataset(args, vocab=vocab, mode='val', tokenizer=tokenizer, with_clip_embs=with_clip_embs)
+    val_dataset = VisualGenomeDataset(args, vocab=vocab, mode='val', tokenizer=tokenizer)
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=1,
@@ -290,16 +232,7 @@ def build_train_dataloader(args, tokenizer=None, with_clip_embs=True):
         collate_fn=collate_fn_graph_batch
     )
 
-    test_dataset = VisualGenomeDataset(args, vocab=vocab, mode='test', tokenizer=tokenizer, with_clip_embs=with_clip_embs)
-    test_dataloader = DataLoader(
-        test_dataset,
-        batch_size=1,
-        num_workers=args.dataloader_num_workers,
-        shuffle=False,
-        collate_fn=collate_fn_graph_batch
-    )
-
-    return train_dataloader, val_dataloader,test_dataloader, vocab
+    return train_dataloader, val_dataloader, vocab
 
 if __name__ == '__main__':
     args = parse_args()

@@ -25,7 +25,7 @@ class SceneVAEModel(nn.Module):
         self.obj_embeddings_decoder = nn.Embedding(num_objs + 1, obj_embedding_dim)
         self.rel_embeddings_encoder = nn.Embedding(num_rels, args.embedding_dim * 2)
         self.rel_embeddings_decoder = nn.Embedding(num_rels, args.embedding_dim * 2)
-        self.box_embeddings = nn.Linear(4, box_embedding_dim)
+        self.box_embeddings = nn.Linear(5, box_embedding_dim)
 
         self.mlp_mean_var = build_mlp(
             [args.embedding_dim * 2 + 512, gconv_hidden_dim, args.embedding_dim * 2], 
@@ -43,7 +43,7 @@ class SceneVAEModel(nn.Module):
             final_nonlinearity=False
         )
         self.mlp_box = build_mlp(
-            [args.embedding_dim * 2 + 512, gconv_hidden_dim, 4], 
+            [args.embedding_dim * 2 + 512, gconv_hidden_dim, 5], 
             batch_norm="batch", 
             final_nonlinearity=False
         )
@@ -113,6 +113,7 @@ class SceneVAEModel(nn.Module):
         # Node Embeding
         obj_embs = self.obj_embeddings_encoder(objs)                # Shape: (O, embedding_dim) = (O, 64)
         obj_embs = torch.cat([obj_clip_embs, obj_embs], dim=1)      # Shape: (O, clip_dim + embedding_dim) = (O, 512 + 64)
+        assert boxes.size(-1) == 5, f"Expected 5D boxes [cx,cy,w,h,angle], got {boxes.size(-1)}"
         box_embs = self.box_embeddings(boxes)                       # Shape: (O, embedding_dim) = (O, 64)
         obj_embs = torch.cat([obj_embs, box_embs], dim=1)           # Shape: (O, clip_dim + embedding_dim * 2) = (O, 512 + 64 * 2)
         
@@ -188,22 +189,27 @@ class SceneVAEModel(nn.Module):
             return box_pred, cond_embs
     
     def collect_data_statistics(self, train_loader, device):
-        pbar = tqdm(train_loader, file=sys.stdout)
-        mean_cat = []
-        for idx, batch in enumerate(pbar):
-            imgs, objs, obj_clip_embs, boxes, triples, rel_clip_embs, obj_to_img, triple_to_img, img_paths, caption = batch
-            objs, triples, boxes = objs.to(device), triples.to(device), boxes.to(device)
-            obj_clip_embs, rel_clip_embs = obj_clip_embs.to(device), rel_clip_embs.to(device)
-
-            mean, logvar = self.encoder(objs, obj_clip_embs, boxes, triples, rel_clip_embs)
-            mean, logvar = mean.cpu().clone(), logvar.cpu().clone()
-
-            mean = mean.data.cpu().clone()
-            mean_cat.append(mean)
-
-        mean_cat = torch.cat(mean_cat, dim=0)
-        mean_est = torch.mean(mean_cat, dim=0, keepdim=True)   # Shape: (1, embedding_dim) = (1, 64)
-        cov_est = np.cov((mean_cat - mean_est).numpy().T)
-        mean_est = mean_est[0]
-
+        prev_mode = self.training
+        self.eval()
+        try:
+            pbar = tqdm(train_loader, file=sys.stdout)
+            mean_cat = []
+            for idx, batch in enumerate(pbar):
+                imgs, objs, obj_clip_embs, boxes, triples, rel_clip_embs, obj_to_img, triple_to_img, img_paths, caption = batch
+                objs, triples, boxes = objs.to(device), triples.to(device), boxes.to(device)
+                obj_clip_embs, rel_clip_embs = obj_clip_embs.to(device), rel_clip_embs.to(device)
+    
+                mean, logvar = self.encoder(objs, obj_clip_embs, boxes, triples, rel_clip_embs)
+                mean, logvar = mean.cpu().clone(), logvar.cpu().clone()
+    
+                mean = mean.data.cpu().clone()
+                mean_cat.append(mean)
+    
+            mean_cat = torch.cat(mean_cat, dim=0)
+            mean_est = torch.mean(mean_cat, dim=0, keepdim=True)   # Shape: (1, embedding_dim) = (1, 64)
+            cov_est = np.cov((mean_cat - mean_est).numpy().T)
+            mean_est = mean_est[0]
+        finally:
+            self.train(prev_mode)
+        
         return mean_est, cov_est

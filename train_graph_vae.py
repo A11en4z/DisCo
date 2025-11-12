@@ -22,7 +22,7 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from eval_graph_vae import Evaluator
+from eval.eval_graph_vae import Evaluator
 from model.box_vae import SceneVAEModel
 from data import build_train_dataloader
 from loss import VaeGaussCriterion, BoxL1Criterion
@@ -30,8 +30,8 @@ from loss import VaeGaussCriterion, BoxL1Criterion
 # accelerate launch train_graph_vae.py --lr_scheduler 'linear' --checkpointing_steps=10000 --batch_size 64
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/model/anonymity/StableDiffusion/stable-diffusion-v1-5', help="Path to pretrained model or model identifier from huggingface.co/models.",)
-    parser.add_argument('--data_dir', type=str, default='/data/anonymity/VisualGenome', help='path to training dataset')
+    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/root/autodl-tmp/stable-diffusion-1.5', help="Path to pretrained model or model identifier from huggingface.co/models.",)
+    parser.add_argument('--data_dir', type=str, default='/root/autodl-tmp/vg', help='path to training dataset')
     parser.add_argument('--output_dir', type=str, default="./results", help='path to save checkpoint')
     parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard log directory.")
     
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--tracker_project_name", type=str, default="vae_box", help="The `project_name` passed to Accelerator",)
     parser.add_argument('--resolution', type=int, default=512, help='resolution')
     parser.add_argument('--batch_size', type=int, default=8, help='batch size')
-    parser.add_argument("--num_train_epochs", type=int, default=200)
+    parser.add_argument("--num_train_epochs", type=int, default=1) # 200
     parser.add_argument("--max_train_steps", type=int, default=None, help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",)
     parser.add_argument("--checkpointing_steps", type=int, default=5000, help="Save a checkpoint of the training state every X updates.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -123,7 +123,7 @@ class Trainer:
 
         # Criterion
         self.vae_gauss_criterion = VaeGaussCriterion()
-        self.box_l1_criterion = BoxL1Criterion()
+        self.box_l1_criterion = BoxL1Criterion(angle_weight=1.0)
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(

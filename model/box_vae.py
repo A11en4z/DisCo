@@ -27,7 +27,8 @@ class SceneVAEModel(nn.Module):
         self.rel_embeddings_encoder = nn.Embedding(num_rels, args.embedding_dim * 2)
         self.rel_embeddings_decoder = nn.Embedding(num_rels, args.embedding_dim * 2)
 
-        self.box_embeddings = nn.Linear(4, box_embedding_dim)
+        #self.box_embeddings = nn.Linear(4, box_embedding_dim)
+        self.box_embeddings = nn.Linear(5, box_embedding_dim)
 
         self.mlp_mean_var = build_mlp(
             [args.embedding_dim * 2 + 512, gconv_hidden_dim, args.embedding_dim * 2], 
@@ -44,11 +45,17 @@ class SceneVAEModel(nn.Module):
             batch_norm="batch",  
             final_nonlinearity=False
         )
+        # self.mlp_box = build_mlp(
+        #     [args.embedding_dim * 2 + 512, gconv_hidden_dim, 4], 
+        #     batch_norm="batch", 
+        #     final_nonlinearity=False
+        # )
         self.mlp_box = build_mlp(
-            [args.embedding_dim * 2 + 512, gconv_hidden_dim, 4], 
+            [args.embedding_dim * 2 + 512, gconv_hidden_dim, 5], 
             batch_norm="batch", 
             final_nonlinearity=False
         )
+
         # self.mlp_box = build_mlp(
         #     [args.embedding_dim * 2 + 512, gconv_hidden_dim, 4], 
         #     batch_norm="batch", 
@@ -133,6 +140,8 @@ class SceneVAEModel(nn.Module):
         # Decoding
         all_embs, _ = self.gconv_decoder(obj_embs, rel_embs, edges)
         box_pred = self.mlp_box(all_embs)
+        # ✅ 角度限制：angle ∈ [−π, π]
+        box_pred[..., 4] = torch.tanh(box_pred[..., 4]) * np.pi
 
         return torch.sigmoid(box_pred)
     
