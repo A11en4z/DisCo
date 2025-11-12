@@ -40,9 +40,14 @@ class BoxL1Criterion(nn.Module):
         # 位置 + 尺寸 L1
         loc_loss = F.l1_loss(pred_box, target_box)
 
-        # 角度周期 loss（平滑 + 可导）
-        angle_diff = pred_angle - target_angle
-        angle_loss = torch.mean(1 - torch.cos(angle_diff))  # ∈ [0, 2]
+        # 仅对非 __image__ 的对象计算角度损失（其框恒为 [0.5, 0.5, 1.0, 1.0]）
+        image_mask = (target_box == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_box.device)).all(dim=-1)
+        valid_mask = ~image_mask
 
-        # 总损失
+        if valid_mask.any():
+            angle_diff = pred_angle[valid_mask] - target_angle[valid_mask]
+            angle_loss = torch.mean(1 - torch.cos(angle_diff))  # ∈ [0, 2]
+        else:
+            angle_loss = torch.tensor(0.0, device=target_box.device)
+
         return loc_loss + self.angle_weight * angle_loss

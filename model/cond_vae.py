@@ -29,22 +29,22 @@ class SceneVAEModel(nn.Module):
 
         self.mlp_mean_var = build_mlp(
             [args.embedding_dim * 2 + 512, gconv_hidden_dim, args.embedding_dim * 2], 
-            batch_norm="batch",
+            batch_norm="layer",
             final_nonlinearity=True
         )
         self.mlp_mean = build_mlp(
             [args.embedding_dim * 2, box_embedding_dim], 
-            batch_norm="batch", 
+            batch_norm="layer", 
             final_nonlinearity=False
         )
         self.mlp_var = build_mlp(
             [args.embedding_dim * 2, box_embedding_dim], 
-            batch_norm="batch",  
+            batch_norm="layer",  
             final_nonlinearity=False
         )
         self.mlp_box = build_mlp(
             [args.embedding_dim * 2 + 512, gconv_hidden_dim, 5], 
-            batch_norm="batch", 
+            batch_norm="layer", 
             final_nonlinearity=False
         )
         # self.mlp_box = build_mlp(
@@ -55,7 +55,7 @@ class SceneVAEModel(nn.Module):
 
         self.cond_mlp = build_mlp(
             [gconv_dim * 2 + 512, 960, 768], 
-            batch_norm="batch", 
+            batch_norm="layer", 
             final_nonlinearity=False
         )
 
@@ -65,7 +65,7 @@ class SceneVAEModel(nn.Module):
             'hidden_dim':           gconv_hidden_dim,
             'num_layers':           5,
             'pooling':              'avg',
-            'mlp_normalization':    'batch',
+            'mlp_normalization':    'layer',
             'residual':             True#
         }
 
@@ -75,7 +75,7 @@ class SceneVAEModel(nn.Module):
             'hidden_dim':           gconv_hidden_dim,
             'num_layers':           5,
             'pooling':              'avg',
-            'mlp_normalization':    'batch',
+            'mlp_normalization':    'layer',
             'residual':             True
         }
 
@@ -85,7 +85,7 @@ class SceneVAEModel(nn.Module):
             'hidden_dim':           gconv_hidden_dim,
             'num_layers':           5,
             'pooling':              'avg',
-            'mlp_normalization':    'batch',
+            'mlp_normalization':    'layer',
             'residual':             True
         }
 
@@ -148,7 +148,20 @@ class SceneVAEModel(nn.Module):
         all_embs, _ = self.gconv_decoder(obj_embs, rel_embs, edges)
         box_pred = self.mlp_box(all_embs)
 
-        return torch.sigmoid(box_pred)
+        # 不能连带角度一块做sigmoid，位置和角度分开处理
+        # 位置和尺寸做sigmoid归一化到[0,1]
+        pos_raw = torch.sigmoid(box_pred[..., :4])
+        angle_raw = torch.tanh(box_pred[..., 4:5]) * np.pi
+        image_mask = (objs == 0)
+
+        fixed_pos_row = torch.tensor([0.5, 0.5, 1.0, 1.0],
+                                     dtype=pos_raw.dtype, device=pos_raw.device).unsqueeze(0).expand(pos_raw.size(0), 4)
+        pos = torch.where(image_mask.unsqueeze(-1), fixed_pos_row, pos_raw)
+        angle = torch.where(image_mask.unsqueeze(-1), torch.zeros_like(angle_raw), angle_raw)
+
+        box_pred = torch.cat([pos, angle], dim=-1)
+        #return torch.sigmoid(box_pred)
+        return box_pred
     
     def conditioner(self, objs, obj_clip_embs, z, triples, rel_clip_embs):
         s, p, o = triples.chunk(3, dim=1)               # Shape: (T, 1), s-subject, p-predicate, o-object

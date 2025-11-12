@@ -66,11 +66,12 @@ class ObjectFusionTokenizer(nn.Module):
 
     def get_instance_mask(self, att_masks, idx, box, image_size):
         cx, cy, w, h = box[0], box[1], box[2], box[3]
-        x1 = int(torch.round((cx - w / 2).clamp(0, 1) * image_size))
-        y1 = int(torch.round((cy - h / 2).clamp(0, 1) * image_size))
-        x2 = int(torch.round((cx + w / 2).clamp(0, 1) * image_size))
-        y2 = int(torch.round((cy + h / 2).clamp(0, 1) * image_size))
-        att_masks[idx][x1:x2, y1:y2] = 1
+        x1 = int(torch.round((cx - w / 2).clamp(0, 1) * image_size).item())
+        y1 = int(torch.round((cy - h / 2).clamp(0, 1) * image_size).item())
+        x2 = int(torch.round((cx + w / 2).clamp(0, 1) * image_size).item())
+        y2 = int(torch.round((cy + h / 2).clamp(0, 1) * image_size).item())
+        # 修正索引顺序为 [y, x]
+        att_masks[idx][y1:y2, x1:x2] = 1
         return att_masks
     
     def get_attention_mask(self, box_masks):

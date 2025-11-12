@@ -603,29 +603,32 @@ class Trainer:
     def layout_visualization(self, objs, boxes, images=None):
         color = list(np.random.choice(range(256), size=(len(boxes), 3)))
         if images == None:
-            layout = Image.new('RGB', size=(self.args.resolution, self.args.resolution)) # Shape: W, H
+            layout = Image.new('RGB', size=(self.args.resolution, self.args.resolution))  # Shape: W, H
         else:
             layout = images.copy()
         draw_layout = ImageDraw.Draw(layout)
-
+    
         for i, (obj, box) in enumerate(zip(objs, boxes)):
             obj_text = self.vocab['object_idx_to_name'][obj]
-            box = box * self.args.resolution
-            # 支持两种框格式：4D 轴对齐 [x0,y0,x1,y1]；5D 旋转框 [cx,cy,w,h,angle]
-            # 当为 torch.Tensor 时转为 numpy，保证几何/绘制计算正常
             if isinstance(box, torch.Tensor):
                 box = box.detach().cpu().numpy()
-
+    
             if len(box) == 4:
-                x0, y0, x1, y1 = box
+                # 缩放到像素坐标
+                x0, y0, x1, y1 = (box * self.args.resolution).tolist()
                 if x1 < x0 or y1 < y0:
                     continue
                 draw_layout.rectangle([x0, y0, x1, y1], outline=tuple(color[i]))
                 draw_layout.text(xy=(x0, y0), text=obj_text, fill=tuple(color[i]))
             elif len(box) == 5:
                 cx, cy, w, h, a = box
-                # 将归一化角度 a∈[0,1] 映射到 [-π, π]
-                theta = (a - 0.5) * 2 * np.pi
+                # 只缩放位置信息
+                cx, cy, w, h = cx * self.args.resolution, cy * self.args.resolution, w * self.args.resolution, h * self.args.resolution
+                # 角度优先认为是弧度；如遇到 [0,1] 则映射到 [-π, π]
+                theta = a
+                if 0.0 <= a <= 1.0:
+                    theta = (a - 0.5) * 2 * np.pi
+    
                 dx, dy = w / 2.0, h / 2.0
                 cos_t, sin_t = np.cos(theta), np.sin(theta)
                 corners = [(-dx, -dy), (-dx,  dy), ( dx,  dy), ( dx, -dy)]

@@ -30,6 +30,8 @@ def build_mlp(dim_list, activation='relu', batch_norm='none',
         if not final_layer or final_nonlinearity:
             if batch_norm == 'batch':
                 layers.append(nn.BatchNorm1d(dim_out))
+            elif batch_norm == 'layer':
+                layers.append(nn.LayerNorm(dim_out))
             if activation == 'relu':
                 layers.append(nn.ReLU())
             elif activation == 'leakyrelu':

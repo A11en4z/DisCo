@@ -107,11 +107,18 @@ class Evaluator(object):
         draw_pred = ImageDraw.Draw(layout_pred)
         for i, (obj, box_pred) in enumerate(zip(objs, boxes_pred)):
             obj_text = self.vocab['object_idx_to_name'][obj]
-            cx, cy, w, h, angle = (box_pred * self.args.resolution).tolist()
-            angle_deg = angle * 180.0 / np.pi
 
+            # 仅缩放位置与尺寸，角度保持弧度
+            cx, cy, w, h, angle = box_pred.tolist()
+            cx, cy, w, h = cx * self.args.resolution, cy * self.args.resolution, w * self.args.resolution, h * self.args.resolution
+
+            # __image__ 的角度强制为 0
+            if obj_text == "__image__":
+                angle = 0.0
+
+            angle_deg = angle * 180.0 / np.pi
             rect = ((cx, cy), (w, h), angle_deg)
-            points = cv2.boxPoints(rect)  # shape: (4,2)
+            points = cv2.boxPoints(rect)
             points = [tuple(p) for p in points]
 
             draw_pred.polygon(points, outline=tuple(color[i]))
@@ -121,9 +128,12 @@ class Evaluator(object):
         draw_gt = ImageDraw.Draw(layout_gt)
         for i, (obj, box_gt) in enumerate(zip(objs, boxes_gt)):
             obj_text = self.vocab['object_idx_to_name'][obj]
-            cx, cy, w, h, angle = (box_gt * self.args.resolution).tolist()
-            angle_deg = angle * 180.0 / np.pi
 
+            # 仅缩放位置与尺寸，角度保持弧度
+            cx, cy, w, h, angle = box_gt.tolist()
+            cx, cy, w, h = cx * self.args.resolution, cy * self.args.resolution, w * self.args.resolution, h * self.args.resolution
+
+            angle_deg = angle * 180.0 / np.pi
             rect = ((cx, cy), (w, h), angle_deg)
             points = cv2.boxPoints(rect)
             points = [tuple(p) for p in points]
