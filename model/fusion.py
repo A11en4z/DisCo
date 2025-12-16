@@ -27,7 +27,8 @@ class ObjectFusionTokenizer(nn.Module):
 
         fourier_freqs = 16
         self.text_dim = 768
-        self.box_dim = fourier_freqs * 2 * 4
+        # 由 4 维扩到 5 维（包含 angle），让对象嵌入也感知旋转
+        self.box_dim = fourier_freqs * 2 * 5
         embedding_dim = self.text_dim + self.box_dim
         self.box_encoder = FourierEmbedder(fourier_freqs)
         self.null_padding_embeddings = torch.nn.Parameter(torch.zeros([embedding_dim]))
@@ -65,33 +66,59 @@ class ObjectFusionTokenizer(nn.Module):
         return object_embeddings, meta_data
 
     def get_instance_mask(self, att_masks, idx, box, image_size):
-        cx, cy, w, h = box[0], box[1], box[2], box[3]
-        x1 = int(torch.round((cx - w / 2).clamp(0, 1) * image_size).item())
-        y1 = int(torch.round((cy - h / 2).clamp(0, 1) * image_size).item())
-        x2 = int(torch.round((cx + w / 2).clamp(0, 1) * image_size).item())
-        y2 = int(torch.round((cy + h / 2).clamp(0, 1) * image_size).item())
-        # 修正索引顺序为 [y, x]
-        att_masks[idx][y1:y2, x1:x2] = 1
+        # 角度感知的旋转矩形掩码（在 64x64 上栅格化）
+        # box: [cx, cy, w, h, angle]，angle 为弧度 [-π, π]
+        cx, cy, w, h = box[0].item(), box[1].item(), box[2].item(), box[3].item()
+        a = box[4].item() if box.shape[0] >= 5 else 0.0
+
+        cx_pix, cy_pix = cx * image_size, cy * image_size
+        w_pix, h_pix = w * image_size, h * image_size
+        dx, dy = w_pix / 2.0, h_pix / 2.0
+        cos_t, sin_t = np.cos(a), np.sin(a)
+        corners = [(-dx, -dy), (-dx,  dy), ( dx,  dy), ( dx, -dy)]
+        points = [(cx_pix + cos_t*px - sin_t*py, cy_pix + sin_t*px + cos_t*py) for px, py in corners]
+
+        from PIL import Image, ImageDraw
+        mask_img = Image.new('L', (image_size, image_size), 0)
+        draw = ImageDraw.Draw(mask_img)
+        draw.polygon(points, outline=1, fill=1)  # 0/1 掩码
+        mask_np = np.array(mask_img, dtype=np.uint8)
+        mask_t = torch.from_numpy(mask_np).to(att_masks.device)
+        att_masks[idx][:] = mask_t
         return att_masks
-    
+
     def get_attention_mask(self, box_masks):
         B = box_masks.shape[0]
         HW =  box_masks.shape[2] *  box_masks.shape[3]
         N = HW + box_masks.shape[1]
-        
+
         n_objs =  box_masks.shape[1]
-        attention_mask =  torch.ones(B, 1, N, N).type(box_masks.dtype).to(box_masks.device)
+        # 显存优化：计算时用 float16
+        box_masks_f = box_masks.to(dtype=torch.float16)
 
-        visual_attention_mask = box_masks.view(B * n_objs, HW, 1)
-        visual_attention_mask = torch.bmm(visual_attention_mask, visual_attention_mask.permute(0,2,1))
-        visual_attention_mask = visual_attention_mask.view(B, n_objs , HW, HW).sum(dim=1)
-        visual_attention_mask[visual_attention_mask > 1] = 1
-        attention_mask[:, :, :HW, :HW] = visual_attention_mask.view(B, 1, HW, HW)
+        attention_mask = torch.ones(B, 1, N, N, dtype=box_masks_f.dtype, device=box_masks.device)
 
-        cond_attention_masks =  box_masks.view(B, 1, n_objs, HW)
+        #############################################
+        # visual_attention_mask = box_masks_f.view(B * n_objs, HW, 1)
+        # visual_attention_mask = torch.bmm(visual_attention_mask, visual_attention_mask.permute(0,2,1))
+        # visual_attention_mask = visual_attention_mask.view(B, n_objs , HW, HW).sum(dim=1)
+        # visual_attention_mask = torch.clamp(visual_attention_mask, max=1.0)
+        # attention_mask[:, :, :HW, :HW] = visual_attention_mask.view(B, 1, HW, HW)
+        # 修改：将视觉自注意力从“并集”改为“逐对象隔离”
+        box_masks_flat = box_masks_f.view(B, n_objs, HW)
+        sum_mask = box_masks_flat.sum(dim=1)
+        has_obj = (sum_mask > 0).to(torch.long)
+        group_ids = torch.argmax(box_masks_flat, dim=1)
+        group_ids = group_ids + (1 - has_obj) * n_objs
+        group_eq = (group_ids.unsqueeze(-1) == group_ids.unsqueeze(-2)).to(attention_mask.dtype)
+        attention_mask[:, :, :HW, :HW] = group_eq.unsqueeze(1)
+        ##########################################
+
+        cond_attention_masks =  box_masks_f.view(B, 1, n_objs, HW)
         attention_mask[:, :, HW:, :HW] = cond_attention_masks
         attention_mask[:, :, :HW, HW:] = cond_attention_masks.permute(0,1,3,2)
-        diagonal_epsilon = torch.eye(N, device=box_masks.device).view(1,1,N,N) * 1e-9
+        eps = 1e-6 if attention_mask.dtype == torch.float16 else 1e-9
+        diagonal_epsilon = torch.eye(N, device=box_masks.device, dtype=attention_mask.dtype).view(1,1,N,N) * eps
         attention_mask = attention_mask + diagonal_epsilon
 
         return attention_mask
@@ -104,9 +131,11 @@ class ObjectFusionTokenizer(nn.Module):
 
         masks = torch.zeros(B, max_objs, device=device)
         text_out = torch.zeros(B, max_objs, 768, device=device)
-        boxes_in = boxes[..., :4]
-        box_out = torch.zeros(B, max_objs, 4, device=device)
-        instance_mask = torch.zeros(B, max_objs, 64, 64, device=device)
+        # 保留角度维度：5D [cx, cy, w, h, angle]
+        boxes_in = boxes[..., :5]
+        box_out = torch.zeros(B, max_objs, 5, device=device)
+        # 显存优化：实例掩码用 uint8，后续计算 attention 时再转浮点
+        instance_mask = torch.zeros(B, max_objs, 64, 64, device=device, dtype=torch.uint8)
 
         for b in range(B):
             idxs = torch.nonzero(obj_to_img == b, as_tuple=False).squeeze(1)

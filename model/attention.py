@@ -120,6 +120,17 @@ class CustomAttnProcessor(nn.Module):
         else:
             if self.is_cma:
                 n_visual = hidden_states.shape[1]
+                dtype = hidden_states.dtype
+                device = hidden_states.device
+                if object_embeddings is not None:
+                    object_embeddings = object_embeddings.to(device=device, dtype=dtype)
+                # 保证处理器内部模块与hidden_states同dtype/device，适配bf16/fp16
+                self.linear = self.linear.to(device=device, dtype=dtype)
+                self.norm1 = self.norm1.to(device=device, dtype=dtype)
+                self.norm2 = self.norm2.to(device=device, dtype=dtype)
+                self.norm3 = self.norm3.to(device=device, dtype=dtype)
+                self.ff = self.ff.to(device=device, dtype=dtype)
+                self.cma = self.cma.to(device=device, dtype=dtype)
                 object_embeddings = self.linear(object_embeddings)
                 attention_output = self.cma(self.norm1(torch.cat([hidden_states, object_embeddings], dim=1)), object_attention_masks)
                 hidden_states = hidden_states + torch.tanh(self.alpha_attn) * attention_output[:, 0:n_visual,:]
