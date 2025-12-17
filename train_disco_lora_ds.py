@@ -471,6 +471,20 @@ class TrainerDS:
         boxes = boxes.to(self.accelerator.device)
         caption = caption.to(self.accelerator.device)
         mu, logvar, layout_preds, semantics_embs = self.model.sl_vae(objs, obj_clip_embs, boxes, triples, rel_clip_embs)
+        if self.accelerator.is_main_process and layout_preds is not None and boxes is not None:
+            try:
+                if layout_preds.ndim == 2 and layout_preds.size(-1) >= 5 and boxes.ndim == 2 and boxes.size(-1) >= 5:
+                    a_pred = layout_preds[:, 4].float()
+                    a_gt = boxes[:, 4].float()
+                    self.logger.info(
+                        f"[val step={int(step)}] angle(rad) pred: mean={a_pred.mean().item():.3f} std={a_pred.std().item():.3f} min={a_pred.min().item():.3f} max={a_pred.max().item():.3f} | gt: mean={a_gt.mean().item():.3f} std={a_gt.std().item():.3f} min={a_gt.min().item():.3f} max={a_gt.max().item():.3f}"
+                    )
+                    deg = 180.0 / float(np.pi)
+                    self.logger.info(
+                        f"[val step={int(step)}] angle(deg) pred: mean={(a_pred.mean().item()*deg):.1f} std={(a_pred.std().item()*deg):.1f} | gt: mean={(a_gt.mean().item()*deg):.1f} std={(a_gt.std().item()*deg):.1f}"
+                    )
+            except Exception:
+                pass
         object_embeddings, meta_data = self.model.fusion(layout_preds.detach(), semantics_embs.squeeze(0), obj_to_img)
         cross_attention_kwargs = {}
         cross_attention_kwargs['object_embeddings'] = torch.cat([object_embeddings, object_embeddings])

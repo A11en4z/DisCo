@@ -40,9 +40,9 @@ from loss import VaeGaussCriterion, BoxL1Criterion
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LoRA fine-tuning script for DisCo.")
-    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/inspire/hdd/global_user/yeziqi-240108100047/yxy/stable-diffusion-v1-5')
-    parser.add_argument('--data_dir', type=str, default='/inspire/hdd/global_user/yeziqi-240108100047/yxy/vg')
-    parser.add_argument('--output_dir', type=str, default="/inspire/hdd/global_user/yeziqi-240108100047/yxy/outputs/")
+    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/gz-data/stable-diffusion-v1-5')
+    parser.add_argument('--data_dir', type=str, default='/gz-data/vg')
+    parser.add_argument('--output_dir', type=str, default="/gz-data/outputs/")
     parser.add_argument("--logging_dir", type=str, default="logs")
 
     parser.add_argument('--dataloader_num_workers', type=int, default=8)
