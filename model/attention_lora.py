@@ -33,6 +33,7 @@ class MaskedSelfAttention(nn.Module):
         inner_dim = dim_head * heads
         self.scale = dim_head ** -0.5
         self.heads = heads
+        self.attention_slice_size = 256
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(query_dim, inner_dim, bias=False)
@@ -51,10 +52,24 @@ class MaskedSelfAttention(nn.Module):
         q = q.reshape(B * H, N, C)
         k = k.reshape(B * H, N, C)
         v = v.reshape(B * H, N, C)
-        sim = torch.einsum('b i c, b j c -> b i j', q, k) * self.scale
-        sim = sim.view(B, H, N, N).masked_fill(attention_masks <= 0.0, float('-inf')).view(B * H, N, N)
-        attn = sim.softmax(dim=-1)
-        out = torch.einsum('b i j, b j c -> b i c', attn, v)
+
+        k_t = k.transpose(1, 2)
+        out = torch.empty((B * H, N, C), device=q.device, dtype=q.dtype)
+        slice_size = int(self.attention_slice_size) if self.attention_slice_size is not None else N
+        slice_size = max(1, min(slice_size, N))
+        neg_inf = torch.finfo(q.dtype).min
+
+        for start in range(0, N, slice_size):
+            end = min(N, start + slice_size)
+            q_chunk = q[:, start:end, :]
+            sim = torch.bmm(q_chunk, k_t) * self.scale
+            if attention_masks is not None:
+                sim = sim.view(B, H, end - start, N)
+                mask_chunk = attention_masks[:, :, start:end, :]
+                sim = sim.masked_fill(mask_chunk <= 0.0, neg_inf)
+                sim = sim.view(B * H, end - start, N)
+            attn = sim.softmax(dim=-1, dtype=torch.float32).to(sim.dtype)
+            out[:, start:end, :] = torch.bmm(attn, v)
         out = out.view(B, H, N, C).permute(0, 2, 1, 3).reshape(B, N, (H * C))
         return self.to_out(out)
 

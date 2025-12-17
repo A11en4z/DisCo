@@ -251,6 +251,7 @@ class Trainer:
         if not os.path.exists(priors_path):
             raise FileNotFoundError(f"box_priors.pt not found in data_dir: {priors_path}")
         self.box_priors = torch.load(priors_path, map_location="cpu")
+        self.box_priors_device = None
 
         if args.use_ema:
             self.ema_unet = UNet2DConditionModel.from_pretrained(args.pretrained_diffusion_model_path, subfolder="unet")
@@ -345,8 +346,7 @@ class Trainer:
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
-                with torch.cuda.amp.autocast(enabled=False):
-                    mu, logvar, layout_pred, semantics_embs = self.sl_vae(objs, obj_clip_embs, layout, triples, rel_clip_embs)
+                mu, logvar, layout_pred, semantics_embs = self.sl_vae(objs, obj_clip_embs, layout, triples, rel_clip_embs)
                 object_embeddings, meta_data = self.object_fusion_tokenizer(layout, semantics_embs.squeeze(0), obj_to_img)
 
                 cross_attention_kwargs = {}
@@ -377,9 +377,7 @@ class Trainer:
                     if not torch.isfinite(overlap_loss):
                         self.logger.warning(f"[step={self.global_step}] overlap_loss is non-finite; zeroed")
                         overlap_loss = torch.tensor(0.0, device=self.accelerator.device)
-                    priors_device = {}
-                    for k, v in self.box_priors.items():
-                        priors_device[int(k)] = {"mean": v["mean"].to(self.accelerator.device), "cov": v["cov"].to(self.accelerator.device)}
+                    priors_device = self._get_box_priors_device()
                     prior_loss = self.category_prior_criterion(layout_pred, objs.to(self.accelerator.device), priors_device, use_angle_prior=self.use_angle_prior, class_weights=self.class_weights)
                     if not torch.isfinite(prior_loss):
                         self.logger.warning(f"[step={self.global_step}] prior_loss is non-finite; zeroed")
@@ -455,6 +453,26 @@ class Trainer:
         avg_loss = self.accelerator.gather(loss.repeat(self.args.batch_size)).mean()
         loss = avg_loss.item() / self.args.gradient_accumulation_steps
         return loss
+
+    def _get_box_priors_device(self):
+        if self.box_priors_device is not None:
+            return self.box_priors_device
+        device = self.accelerator.device
+        priors_device = {}
+        for k, v in self.box_priors.items():
+            kk = int(k)
+            mean = v.get("mean")
+            cov = v.get("cov")
+            if not torch.is_tensor(mean):
+                mean = torch.as_tensor(mean)
+            if not torch.is_tensor(cov):
+                cov = torch.as_tensor(cov)
+            priors_device[kk] = {
+                "mean": mean.to(device=device, dtype=torch.float32, non_blocking=True),
+                "cov": cov.to(device=device, dtype=torch.float32, non_blocking=True),
+            }
+        self.box_priors_device = priors_device
+        return self.box_priors_device
 
     @torch.no_grad()
     def log_validation(self, step, ref_batch):
