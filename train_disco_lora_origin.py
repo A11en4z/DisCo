@@ -441,7 +441,7 @@ class Trainer:
         scaled_latents = 1.0 / 0.18215 * latent
         image = self.vae.decode(scaled_latents.to(self.weight_dtype)).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+        image = image.detach().to(torch.float32).cpu().permute(0, 2, 3, 1).numpy()
         image = (image * 255).round().astype("uint8")
         # 恢复两列网格：左图像，右布局（添加关系），不叠加
         obj_to_img = obj_to_img.to(self.accelerator.device)
@@ -471,7 +471,7 @@ class Trainer:
                 # 保存真实图两列：左真实，右布局+关系（基于GT boxes）
                 real_pair = Image.new('RGB', size=(self.args.resolution * 2, self.args.resolution))
                 real_img = imgs[i].detach().cpu()
-                real_img = (real_img / 2 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+                real_img = (real_img / 2 + 0.5).clamp(0, 1).to(torch.float32).permute(1, 2, 0).numpy()
                 real_img = (real_img * 255).round().astype("uint8")
                 real_pair.paste(Image.fromarray(real_img), box=(0, 0))
                 boxes_real_i = boxes[mask_obj]
@@ -505,7 +505,7 @@ class Trainer:
             obj_idx = int(obj.item()) if isinstance(obj, torch.Tensor) else obj
             obj_text = self.vocab['object_idx_to_name'][obj_idx]
             if isinstance(box, torch.Tensor):
-                box = box.detach().cpu().numpy()
+                box = box.detach().to(torch.float32).cpu().numpy()
             if image_idx is not None and obj_idx == image_idx:
                 continue
 

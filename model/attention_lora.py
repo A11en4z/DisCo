@@ -4,6 +4,8 @@ import torch.nn as nn
 
 from diffusers.models.attention_processor import Attention, AttnProcessor
 
+import torch.nn.functional as F
+
 
 class GEGLU(nn.Module):
     def __init__(self, dim_in, dim_out):
@@ -162,6 +164,71 @@ class NoOpAttnProcessor(AttnProcessor):
         return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask)
 
 
+class MemoryEfficientAttnProcessor(AttnProcessor):
+    def __init__(self, attention_slice_size: int = 256):
+        super().__init__()
+        self.attention_slice_size = attention_slice_size
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None, object_embeddings=None, object_attention_masks=None):
+        if attention_mask is not None:
+            return super().__call__(attn, hidden_states, encoder_hidden_states, attention_mask)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        bsz = hidden_states.shape[0]
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        heads = getattr(attn, "heads", None)
+        if heads is None:
+            heads = int(query.shape[0] // bsz)
+
+        q_len = query.shape[1]
+        k_len = key.shape[1]
+        head_dim = query.shape[2]
+
+        use_sdpa = hasattr(F, "scaled_dot_product_attention") and query.is_cuda
+        if use_sdpa:
+            try:
+                q = query.view(bsz, heads, q_len, head_dim)
+                k = key.view(bsz, heads, k_len, head_dim)
+                v = value.view(bsz, heads, k_len, head_dim)
+
+                dropout_p = getattr(attn, "dropout", 0.0)
+                if isinstance(dropout_p, nn.Dropout):
+                    dropout_p = dropout_p.p
+                dropout_p = float(dropout_p) if attn.training else 0.0
+
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=False)
+                hidden_states = out.transpose(1, 2).reshape(bsz, q_len, heads * head_dim)
+            except RuntimeError:
+                use_sdpa = False
+
+        if not use_sdpa:
+            k_t = key.transpose(1, 2)
+            out = torch.empty((bsz * heads, q_len, head_dim), device=query.device, dtype=query.dtype)
+            slice_size = int(self.attention_slice_size) if self.attention_slice_size is not None else q_len
+            slice_size = max(1, min(slice_size, q_len))
+            for start in range(0, q_len, slice_size):
+                end = min(q_len, start + slice_size)
+                q_chunk = query[:, start:end, :]
+                sim = torch.bmm(q_chunk, k_t) * getattr(attn, "scale", (head_dim**-0.5))
+                attn_chunk = sim.softmax(dim=-1, dtype=torch.float32).to(sim.dtype)
+                out[:, start:end, :] = torch.bmm(attn_chunk, value)
+            hidden_states = attn.batch_to_head_dim(out)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
 def register_attention_control_lora(unet, lora_rank=8):
     attn_procs = {}
     for name, module in unet.named_modules():
@@ -170,7 +237,7 @@ def register_attention_control_lora(unet, lora_rank=8):
             if query_dim is None:
                 continue
             is_cross = ('attn2' in name)
-            proc = CustomCMALoraProcessor(query_dim) if is_cross else NoOpAttnProcessor()
+            proc = CustomCMALoraProcessor(query_dim) if is_cross else MemoryEfficientAttnProcessor()
             if hasattr(module, 'set_processor'):
                 module.set_processor(proc)
             else:
