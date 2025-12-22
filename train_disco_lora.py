@@ -35,15 +35,19 @@ from model.fusion import ObjectFusionTokenizer
 from model.cond_vae_lora import SceneVAEModel
 from model.attention_lora import register_attention_control_lora, get_lora_parameters, get_cma_small_parameters, attach_lora_layers
 from data_lora import build_train_dataloader
-from loss import VaeGaussCriterion, BoxL1Criterion
-from loss import SameClassOverlapCriterion, CategoryPriorCriterion
+from loss import VaeGaussCriterion, BoxL1ConstraintCriterion
 
 
 def parse_args():
+    """解析训练参数。
+
+    该脚本仅在 `train_disco_lora.py` 中启用更强的布局约束（长宽比/最小尺寸），
+    以降低极端长条框与后期塌缩框的概率；原始训练脚本保持不变。
+    """
     parser = argparse.ArgumentParser(description="LoRA fine-tuning script for DisCo.")
     parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/gz-data/stable-diffusion-v1-5')
     parser.add_argument('--data_dir', type=str, default='/gz-data/vg')
-    parser.add_argument('--output_dir', type=str, default="/gz-data/outputs/dq")
+    parser.add_argument('--output_dir', type=str, default="/gz-data/outputs/")
     parser.add_argument("--logging_dir", type=str, default="logs")
 
     parser.add_argument('--dataloader_num_workers', type=int, default=8)
@@ -75,14 +79,38 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--num_validation_images", type=int, default=8)
     parser.add_argument("--angle_loss_weight", type=float, default=1.0)
-    parser.add_argument("--aux_loss_warmup_steps", type=int, default=10000)
+
+    parser.add_argument(
+        "--box_constraint_weight",
+        type=float,
+        default=0.01,
+        help="约束正则权重 λ（建议很小；仅在异常框上起作用，避免影响原有 loss 分布）",
+    )
+    parser.add_argument(
+        "--box_ratio_max",
+        type=float,
+        default=10.0,
+        help="最大允许长宽比（w/h 或 h/w）上限，超过后才开始惩罚",
+    )
+    parser.add_argument(
+        "--box_min_size",
+        type=float,
+        default=0.01,
+        help="最小边长（归一化坐标）；小于该值会被惩罚以抑制后期塌缩",
+    )
+    parser.add_argument(
+        "--box_constraint_classes",
+        type=str,
+        default="baseballfield",
+        help="仅对这些类别启用框约束（逗号分隔的类别名）；为空则对所有类别启用",
+    )
 
     parser.add_argument("--vae_loss_weight", type=float, default=0.1)
     parser.add_argument("--box_loss_weight", type=float, default=1.0)
     parser.add_argument("--diff_loss_weight", type=float, default=1.0)
     parser.add_argument('--embedding_dim', type=int, default=64)
 
-    parser.add_argument('--lora_rank', type=int, default=64)
+    parser.add_argument('--lora_rank', type=int, default=32)
     parser.add_argument('--freeze_unet', action='store_true')
     parser.add_argument('--unet_base_lr', type=float, default=5e-6)
 
@@ -135,6 +163,15 @@ class Trainer:
                 os.makedirs(args.output_dir, exist_ok=True)
                 with open(f'{args.output_dir}/config.json', 'wt') as f:
                     json.dump(vars(args), f, indent=4)
+                try:
+                    src_path = os.path.abspath(__file__)
+                    dst_path = os.path.join(args.output_dir, os.path.basename(src_path))
+                    with open(src_path, 'rt') as sf:
+                        code = sf.read()
+                    with open(dst_path, 'wt') as df:
+                        df.write(code)
+                except Exception as e:
+                    self.logger.warning(f"[init] failed to snapshot script: {e}")
 
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_diffusion_model_path, subfolder="scheduler")
         self.scheduler = PNDMScheduler.from_pretrained(args.pretrained_diffusion_model_path, subfolder="scheduler")
@@ -152,7 +189,6 @@ class Trainer:
 
         self.unet = UNet2DConditionModel.from_pretrained(args.pretrained_diffusion_model_path, subfolder="unet")
 
-        # Data
         self.train_dataloader, self.val_dataloader, _, self.vocab = build_train_dataloader(args, tokenizer=self.tokenizer)
 
         num_objs = len(self.vocab['object_idx_to_name'])
@@ -161,16 +197,21 @@ class Trainer:
         self.sl_vae = SceneVAEModel(self.args, num_objs, num_rels, image_obj_idx=image_obj_idx)
         self.object_fusion_tokenizer = ObjectFusionTokenizer()
 
-        # 加载数据集统计量 box_stats.pt（不再训练时生成）
-        stats_path = os.path.join(args.data_dir, "box_stats.pt")
-        if not os.path.exists(stats_path):
-            raise FileNotFoundError(f"box_stats.pt not found in data_dir: {stats_path}")
+        stats_path = os.path.join(args.output_dir, "box_stats.pt")
+        if self.accelerator.is_main_process:
+            self.logger.info("[init] collect_data_statistics:start")
+            device_cpu = torch.device("cpu")
+            self.box_mean_est, self.box_cov_est = self.sl_vae.collect_data_statistics(self.train_dataloader, device_cpu)
+            mean_t = torch.as_tensor(self.box_mean_est)
+            cov_t = torch.as_tensor(self.box_cov_est)
+            torch.save({"mean": mean_t.cpu(), "cov": cov_t.cpu()}, stats_path)
+            self.logger.info("[init] collect_data_statistics:done & saved")
+        else:
+            self.box_mean_est, self.box_cov_est = None, None
 
-        # Freeze vae and text_encoder
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
 
-        # Register LoRA + CMA processors; freeze UNet base if requested
         if args.freeze_unet:
             self.unet.requires_grad_(False)
         register_attention_control_lora(self.unet, lora_rank=args.lora_rank)
@@ -182,17 +223,26 @@ class Trainer:
         self.sl_vae.train()
         self.object_fusion_tokenizer.train()
 
-        # Criterion
         self.vae_criterion = VaeGaussCriterion()
-        self.box_criterion = BoxL1Criterion(angle_weight=self.args.angle_loss_weight)
-        self.same_class_criterion = SameClassOverlapCriterion()
-        self.category_prior_criterion = CategoryPriorCriterion()
-        self.class_weights = None
-        self.same_overlap_weight = 0.0
-        self.category_prior_weight = 0.0
-        self.use_angle_prior = False
+        constraint_class_ids = None
+        raw_names = [x.strip() for x in str(self.args.box_constraint_classes).split(",") if x.strip()]
+        if len(raw_names) > 0:
+            constraint_class_ids = []
+            for name in raw_names:
+                if name in self.vocab["object_name_to_idx"]:
+                    constraint_class_ids.append(int(self.vocab["object_name_to_idx"][name]))
+                else:
+                    self.logger.warning(f"[init] box_constraint_classes name not found in vocab: {name}")
+        self.box_criterion = BoxL1ConstraintCriterion(
+            angle_weight=self.args.angle_loss_weight,
+            constraint_weight=self.args.box_constraint_weight,
+            ratio_max=self.args.box_ratio_max,
+            min_size=self.args.box_min_size,
+            constraint_class_ids=constraint_class_ids,
+        )
+        # 注意：约束项通过 hinge 形式仅对“异常框”施加额外梯度，
+        # 默认权重很小，目标是不改变原有 box_loss 的主导分布。
 
-        # Optimizer param groups: LoRA, CMA small, fusion, sl_vae
         lora_params = get_lora_parameters(self.unet)
         cma_params = get_cma_small_parameters(self.unet)
         fusion_params = list(self.object_fusion_tokenizer.parameters())
@@ -242,16 +292,10 @@ class Trainer:
             self.sl_vae,
             self.object_fusion_tokenizer,
         )
-        # 同步并加载数据集提供的 box 统计量到各进程
         self.accelerator.wait_for_everyone()
         stats = torch.load(stats_path, map_location="cpu")
         self.box_mean_est = stats["mean"].numpy()
         self.box_cov_est = stats["cov"].numpy()
-        priors_path = os.path.join(args.data_dir, "box_priors.pt")
-        if not os.path.exists(priors_path):
-            raise FileNotFoundError(f"box_priors.pt not found in data_dir: {priors_path}")
-        self.box_priors = torch.load(priors_path, map_location="cpu")
-        self.box_priors_device = None
 
         if args.use_ema:
             self.ema_unet = UNet2DConditionModel.from_pretrained(args.pretrained_diffusion_model_path, subfolder="unet")
@@ -327,10 +371,6 @@ class Trainer:
         log_box_loss = 0.0
         log_vae_loss = 0.0
         log_diff_loss = 0.0
-        log_overlap_loss = 0.0
-        log_prior_loss = 0.0
-        log_overlap_loss_w = 0.0
-        log_prior_loss_w = 0.0
         if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
             self.train_dataloader.sampler.set_epoch(epoch)
             self.logger.info(f"[epoch={epoch}] set train sampler epoch")
@@ -357,56 +397,19 @@ class Trainer:
                 encoder_hidden_states = self.text_encoder(caption, return_dict=False)[0]
                 model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs, return_dict=False)[0]
 
-                vae_loss = self.vae_criterion(mu.float(), logvar.float())
-                box_loss = self.box_criterion(layout_pred.float(), layout.float(), objs=objs.to(self.accelerator.device), class_weights=self.class_weights)
+                vae_loss = self.vae_criterion(mu, logvar)
+                box_loss = self.box_criterion(layout_pred, layout, objs=objs)
                 diff_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                aux_enable = self.global_step >= self.args.aux_loss_warmup_steps
-                if aux_enable:
-                    if self.class_weights is None:
-                        self.class_weights = torch.ones((len(self.vocab['object_idx_to_name']),), device=self.accelerator.device)
-                    image_idx = self.vocab['object_name_to_idx'].get('__image__', None)
-                    overlap_loss = self.same_class_criterion(
-                        layout_pred,
-                        objs.to(self.accelerator.device),
-                        obj_to_img.to(self.accelerator.device),
-                        image_idx=image_idx,
-                        class_weights=self.class_weights,
-                        mode='oriented',
-                        theta_eps=0.087,
-                    )
-                    if not torch.isfinite(overlap_loss):
-                        self.logger.warning(f"[step={self.global_step}] overlap_loss is non-finite; zeroed")
-                        overlap_loss = torch.tensor(0.0, device=self.accelerator.device)
-                    priors_device = self._get_box_priors_device()
-                    prior_loss = self.category_prior_criterion(layout_pred, objs.to(self.accelerator.device), priors_device, use_angle_prior=self.use_angle_prior, class_weights=self.class_weights)
-                    if not torch.isfinite(prior_loss):
-                        self.logger.warning(f"[step={self.global_step}] prior_loss is non-finite; zeroed")
-                        prior_loss = torch.tensor(0.0, device=self.accelerator.device)
-                    aux_term = self.same_overlap_weight * overlap_loss + self.category_prior_weight * prior_loss
-                else:
-                    overlap_loss = torch.tensor(0.0, device=self.accelerator.device)
-                    prior_loss = torch.tensor(0.0, device=self.accelerator.device)
-                    aux_term = torch.tensor(0.0, device=self.accelerator.device)
-                loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + diff_loss * self.args.diff_loss_weight + aux_term
-
-                if not torch.isfinite(loss):
-                    self.logger.warning(f"[step={self.global_step}] total loss is non-finite; skip step. box={box_loss.item():.4f}, vae={vae_loss.item():.4f}, diff={diff_loss.item():.4f}, overlap={overlap_loss.item():.4f}, prior={prior_loss.item():.4f}")
-                    self.optimizer.zero_grad()
-                    continue
+                loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + diff_loss * self.args.diff_loss_weight
 
                 log_loss += self.gather_loss(loss)
                 log_box_loss += self.gather_loss(box_loss)
                 log_vae_loss += self.gather_loss(vae_loss)
                 log_diff_loss += self.gather_loss(diff_loss)
-                log_overlap_loss += self.gather_loss(overlap_loss)
-                log_prior_loss += self.gather_loss(prior_loss)
-                log_overlap_loss_w += self.gather_loss(self.same_overlap_weight * overlap_loss)
-                log_prior_loss_w += self.gather_loss(self.category_prior_weight * prior_loss)
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
-                    all_params = list(self.unet.parameters()) + list(self.sl_vae.parameters()) + list(self.object_fusion_tokenizer.parameters())
-                    self.accelerator.clip_grad_norm_(all_params, self.args.max_grad_norm)
+                    self.accelerator.clip_grad_norm_(self.unet.parameters(), self.args.max_grad_norm)
 
                 self.lr_scheduler.step()
                 self.optimizer.step()
@@ -421,19 +424,11 @@ class Trainer:
                 self.accelerator.log({"box_loss": log_box_loss}, step=self.global_step)
                 self.accelerator.log({"vae_loss": log_vae_loss}, step=self.global_step)
                 self.accelerator.log({"diff_loss": log_diff_loss}, step=self.global_step)
-                self.accelerator.log({"overlap_loss": log_overlap_loss}, step=self.global_step)
-                self.accelerator.log({"prior_loss": log_prior_loss}, step=self.global_step)
-                self.accelerator.log({"overlap_loss_weighted": log_overlap_loss_w}, step=self.global_step)
-                self.accelerator.log({"prior_loss_weighted": log_prior_loss_w}, step=self.global_step)
                 self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]}, step=self.global_step)
                 log_loss = 0.0
                 log_box_loss = 0.0
                 log_vae_loss = 0.0
                 log_diff_loss = 0.0
-                log_overlap_loss = 0.0
-                log_prior_loss = 0.0
-                log_overlap_loss_w = 0.0
-                log_prior_loss_w = 0.0
 
                 logs = {"step_loss": '%.4f' % loss.detach().item(), "lr": '%.2e' % self.lr_scheduler.get_last_lr()[0]}
                 self.progress_bar.set_postfix(**logs)
@@ -453,26 +448,6 @@ class Trainer:
         avg_loss = self.accelerator.gather(loss.repeat(self.args.batch_size)).mean()
         loss = avg_loss.item() / self.args.gradient_accumulation_steps
         return loss
-
-    def _get_box_priors_device(self):
-        if self.box_priors_device is not None:
-            return self.box_priors_device
-        device = self.accelerator.device
-        priors_device = {}
-        for k, v in self.box_priors.items():
-            kk = int(k)
-            mean = v.get("mean")
-            cov = v.get("cov")
-            if not torch.is_tensor(mean):
-                mean = torch.as_tensor(mean)
-            if not torch.is_tensor(cov):
-                cov = torch.as_tensor(cov)
-            priors_device[kk] = {
-                "mean": mean.to(device=device, dtype=torch.float32, non_blocking=True),
-                "cov": cov.to(device=device, dtype=torch.float32, non_blocking=True),
-            }
-        self.box_priors_device = priors_device
-        return self.box_priors_device
 
     @torch.no_grad()
     def log_validation(self, step, ref_batch):
@@ -515,7 +490,7 @@ class Trainer:
         scaled_latents = 1.0 / 0.18215 * latent
         image = self.vae.decode(scaled_latents.to(self.weight_dtype)).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.detach().cpu().permute(0, 2, 3, 1).numpy()
+        image = image.detach().to(torch.float32).cpu().permute(0, 2, 3, 1).numpy()
         image = (image * 255).round().astype("uint8")
         obj_to_img = obj_to_img.to(self.accelerator.device)
         triple_to_img = triple_to_img.to(self.accelerator.device)
@@ -531,9 +506,8 @@ class Trainer:
             mask_obj = (obj_to_img == i)
             mask_rel = (triple_to_img == i)
             objs_i = objs[mask_obj]
-            boxes_pred_i = layout_preds[mask_obj]
             triples_i = triples[mask_rel]
-            layout_img = self.layout_visualization(objs_i, boxes_pred_i, images=None, triples=triples_i, obj_indices=mask_obj.nonzero().view(-1).detach().cpu().numpy().tolist())
+            layout_img = self.layout_visualization(objs_i, layout_preds[mask_obj], images=None, triples=triples_i, obj_indices=mask_obj.nonzero().view(-1).detach().cpu().numpy().tolist())
             pair.paste(layout_img, box=(self.args.resolution, 0))
             if self.accelerator.is_main_process:
                 basename = os.path.basename(img_paths[i]) if isinstance(img_paths[i], str) else str(i)
@@ -541,11 +515,10 @@ class Trainer:
                 pair.save(pair_path)
                 real_pair = Image.new('RGB', size=(self.args.resolution * 2, self.args.resolution))
                 real_img = imgs[i].detach().cpu()
-                real_img = (real_img / 2 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+                real_img = (real_img / 2 + 0.5).clamp(0, 1).to(torch.float32).permute(1, 2, 0).numpy()
                 real_img = (real_img * 255).round().astype("uint8")
                 real_pair.paste(Image.fromarray(real_img), box=(0, 0))
-                boxes_real_i = boxes[mask_obj]
-                layout_real = self.layout_visualization(objs_i, boxes_real_i, images=None, triples=triples_i, obj_indices=mask_obj.nonzero().view(-1).detach().cpu().numpy().tolist())
+                layout_real = self.layout_visualization(objs_i, boxes[mask_obj], images=None, triples=triples_i, obj_indices=mask_obj.nonzero().view(-1).detach().cpu().numpy().tolist())
                 real_pair.paste(layout_real, box=(self.args.resolution, 0))
                 real_pair.save(os.path.join(real_root, f"{i:03d}_{basename}_real_pair.png"))
         latent = None
@@ -555,7 +528,6 @@ class Trainer:
         object_embeddings = None
         meta_data = None
         torch.cuda.empty_cache()
-
 
     def layout_visualization(self, objs, boxes, images=None, triples=None, obj_indices=None):
         palette = [(255, 0, 0), (0, 255, 0), (0, 128, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255), (255, 128, 0), (255, 255, 255)]
@@ -572,48 +544,30 @@ class Trainer:
             obj_idx = int(obj.item()) if isinstance(obj, torch.Tensor) else obj
             obj_text = self.vocab['object_idx_to_name'][obj_idx]
             if isinstance(box, torch.Tensor):
-                box = box.detach().cpu().numpy()
+                box = box.detach().to(torch.float32).cpu().numpy()
             if image_idx is not None and obj_idx == image_idx:
                 continue
 
-            arr = np.asarray(box, dtype=np.float32)
-            if arr.ndim != 1:
-                arr = arr.flatten()
-            if not np.all(np.isfinite(arr)):
-                try:
-                    self.logger.error(f"检测到NaN/Inf：对象={obj_text}(idx={obj_idx})，box={arr.tolist()}")
-                except Exception:
-                    pass
-                continue
-
-            if len(arr) == 4:
-                x0, y0, x1, y1 = (arr * self.args.resolution).tolist()
+            if len(box) == 4:
+                x0, y0, x1, y1 = (box * self.args.resolution).tolist()
                 if x1 < x0 or y1 < y0:
                     continue
-                x0 = float(np.clip(x0, 0, self.args.resolution - 1))
-                y0 = float(np.clip(y0, 0, self.args.resolution - 1))
-                x1 = float(np.clip(x1, 0, self.args.resolution - 1))
-                y1 = float(np.clip(y1, 0, self.args.resolution - 1))
                 c = palette[i % len(palette)]
                 draw_layout.rectangle([x0, y0, x1, y1], outline=c, width=1)
                 draw_layout.text(xy=(int(x0), int(y0)), text=obj_text, fill=c)
                 centers.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
                 local_obj_indices.append(i)
-            elif len(arr) == 5:
-                cx, cy, w, h, a = arr
-                if w <= 0 or h <= 0:
-                    continue
+            elif len(box) == 5:
+                cx, cy, w, h, a = box
                 cx, cy, w, h = cx * self.args.resolution, cy * self.args.resolution, w * self.args.resolution, h * self.args.resolution
-                if not np.all(np.isfinite([cx, cy, w, h, a])):
-                    continue
                 theta = float(a)
                 dx, dy = w / 2.0, h / 2.0
                 cos_t, sin_t = np.cos(theta), np.sin(theta)
-                corners = [(-dx, -dy), (-dx, dy), (dx, dy), (dx, -dy)]
+                corners = [(-dx, -dy), (-dx,  dy), ( dx,  dy), ( dx, -dy)]
                 points = [(cx + cos_t*px - sin_t*py, cy + sin_t*px + cos_t*py) for px, py in corners]
                 c = palette[i % len(palette)]
                 draw_layout.line(points + [points[0]], fill=c, width=1)
-                draw_layout.text(xy=(int(np.clip(cx, 0, self.args.resolution - 1)), int(np.clip(cy, 0, self.args.resolution - 1))), text=obj_text, fill=c)
+                draw_layout.text(xy=(int(cx), int(cy)), text=obj_text, fill=c)
                 centers.append((cx, cy))
                 local_obj_indices.append(i)
 
@@ -663,6 +617,7 @@ class Trainer:
                 draw_layout.text(xy=(int(mx), int(my)), text=pred_text, fill=rel_color)
 
         return layout
+
 
 if __name__ == '__main__':
     args = parse_args()

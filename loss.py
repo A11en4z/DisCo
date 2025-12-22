@@ -24,38 +24,105 @@ class VaeGaussCriterion(nn.Module):
 #         loss = F.l1_loss(pred, target)
 #         return loss
     
+# class BoxL1Criterion(nn.Module):
+#     def __init__(self, angle_weight=1.0):
+#         super(BoxL1Criterion, self).__init__()
+#         self.angle_weight = angle_weight
+#
+#     def forward(self, pred, target, objs=None, class_weights=None):
+#         # 支持类别加权的几何拟合损失：
+#         # - 几何位置/尺寸采用逐对象加权平均；
+#         # - 角度一致性仅作用于非 __image__ 的对象；
+#         # - class_weights 为类别→权重张量，若为空则退化为普通平均。
+#         pred_box = pred[..., :4].float()
+#         target_box = target[..., :4].float()
+#         pred_angle = pred[..., 4].float()
+#         target_angle = target[..., 4].float()
+#         if class_weights is not None and objs is not None:
+#             w = class_weights[objs.long()].float()
+#         else:
+#             w = None
+#         loc_diff = torch.abs(pred_box - target_box)
+#         loc_loss_i = loc_diff.mean(dim=-1)
+#         pred_w, pred_h = pred_box[..., 2], pred_box[..., 3]
+#         tgt_w, tgt_h = target_box[..., 2], target_box[..., 3]
+#         area_pred = pred_w * pred_h
+#         area_tgt = tgt_w * tgt_h
+#         area_l1_i = torch.abs(area_pred - area_tgt)
+#         geom_i = loc_loss_i + 0.5 * area_l1_i
+#         if w is not None:
+#             geom_loss = (geom_i * w).sum() / (w.sum() + 1e-6)
+#         else:
+#             geom_loss = geom_i.mean()
+#         image_mask = (target_box == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_box.device)).all(dim=-1)
+#         valid_mask = ~image_mask
+#         if valid_mask.any():
+#             angle_diff = pred_angle[valid_mask] - target_angle[valid_mask]
+#             base = (1 - torch.cos(angle_diff))
+#             if w is not None:
+#                 wv = w[valid_mask]
+#                 angle_loss = (base * wv).sum() / (wv.sum() + 1e-6)
+#             else:
+#                 angle_loss = base.mean()
+#         else:
+#             angle_loss = torch.tensor(0.0, device=target_box.device, dtype=geom_loss.dtype)
+#         return geom_loss + self.angle_weight * angle_loss
+
 class BoxL1Criterion(nn.Module):
+    """基础框回归损失（保持与历史版本一致）。
+
+    预测/GT 均为归一化旋转框：`[cx, cy, w, h, angle]`。
+
+    公式：
+    - `L_loc = mean(|p_xywh - t_xywh|)`（对 4 维取均值）
+    - `L_area = |(p_w p_h) - (t_w t_h)|`
+    - `L_angle = mean(1 - cos(p_a - t_a))`（仅作用于非 `__image__` 框）
+
+    总损失：`L = L_loc + 0.5*L_area + angle_weight * L_angle`。
+
+    可选：支持按类别加权（`class_weights[objs]`）。
+    """
+
     def __init__(self, angle_weight=1.0):
-        super(BoxL1Criterion, self).__init__()
+        super().__init__()
         self.angle_weight = angle_weight
 
     def forward(self, pred, target, objs=None, class_weights=None):
-        # 支持类别加权的几何拟合损失：
-        # - 几何位置/尺寸采用逐对象加权平均；
-        # - 角度一致性仅作用于非 __image__ 的对象；
-        # - class_weights 为类别→权重张量，若为空则退化为普通平均。
+        """计算基础几何拟合损失。
+
+        参数:
+        - pred: 预测框张量 `[..., 5]`
+        - target: GT 框张量 `[..., 5]`
+        - objs/class_weights: 若提供则对每个对象使用类别权重做加权平均
+        """
         pred_box = pred[..., :4].float()
         target_box = target[..., :4].float()
         pred_angle = pred[..., 4].float()
         target_angle = target[..., 4].float()
+
         if class_weights is not None and objs is not None:
             w = class_weights[objs.long()].float()
         else:
             w = None
+
         loc_diff = torch.abs(pred_box - target_box)
         loc_loss_i = loc_diff.mean(dim=-1)
+
         pred_w, pred_h = pred_box[..., 2], pred_box[..., 3]
         tgt_w, tgt_h = target_box[..., 2], target_box[..., 3]
         area_pred = pred_w * pred_h
         area_tgt = tgt_w * tgt_h
         area_l1_i = torch.abs(area_pred - area_tgt)
+
         geom_i = loc_loss_i + 0.5 * area_l1_i
         if w is not None:
             geom_loss = (geom_i * w).sum() / (w.sum() + 1e-6)
         else:
             geom_loss = geom_i.mean()
+
         image_mask = (target_box == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_box.device)).all(dim=-1)
         valid_mask = ~image_mask
+
         if valid_mask.any():
             angle_diff = pred_angle[valid_mask] - target_angle[valid_mask]
             base = (1 - torch.cos(angle_diff))
@@ -66,7 +133,153 @@ class BoxL1Criterion(nn.Module):
                 angle_loss = base.mean()
         else:
             angle_loss = torch.tensor(0.0, device=target_box.device, dtype=geom_loss.dtype)
+
         return geom_loss + self.angle_weight * angle_loss
+
+class BoxL1ConstraintCriterion(nn.Module):
+    """带约束的框回归损失（在不显著改变原 loss 分布的前提下抑制退化解）。
+
+    目标:
+    - 抑制极端长条：`w/h` 过大或过小
+    - 抑制塌缩：`w` 或 `h` 过小（训练后期框缩到“超级小”）
+
+    总损失：
+    `L = L_base + constraint_weight * L_constraint`
+
+    其中 `L_base` 与 `BoxL1Criterion` 相同。
+
+    约束项（仅在超出阈值时产生惩罚，避免干扰大多数正常样本）：
+    - 比例惩罚（尺度无关）：
+      `r = log((w+eps)/(h+eps))`
+      `L_ratio = relu(|r| - log(ratio_max))`
+    - 最小尺寸惩罚：
+      `L_min = relu(min_size - w) + relu(min_size - h)`
+
+    说明:
+    - `ratio_max` 与 `min_size` 都基于归一化坐标（与原图分辨率无关）。
+    - 默认 `constraint_weight` 建议取很小（如 0.01），使新增项只在异常框上起作用。
+    - 若传入 `constraint_class_ids`，则约束项只对这些类别生效（避免误伤天然长条类）。
+    """
+
+    def __init__(
+        self,
+        angle_weight=1.0,
+        constraint_weight=0.0,
+        ratio_max=10.0,
+        min_size=0.01,
+        eps=1e-6,
+        constraint_class_ids=None,
+    ):
+        """初始化带约束的框回归损失。
+
+        参数:
+        - angle_weight: 角度一致性权重（同 `BoxL1Criterion`）
+        - constraint_weight: 约束项权重 λ；取 0 表示关闭约束
+        - ratio_max: 允许的最大长宽比上限（`max(w/h, h/w)`）
+        - min_size: 最小边长阈值（归一化坐标）
+        - eps: 数值稳定项
+        - constraint_class_ids: 约束生效类别 id 白名单；None 表示对所有类别生效
+        """
+        super().__init__()
+        self.angle_weight = float(angle_weight)
+        self.constraint_weight = float(constraint_weight)
+        self.ratio_max = float(ratio_max)
+        self.min_size = float(min_size)
+        self.eps = float(eps)
+        if constraint_class_ids is None:
+            self.constraint_class_ids = None
+        else:
+            self.constraint_class_ids = [int(x) for x in constraint_class_ids]
+
+    def _build_constraint_mask(self, valid_mask, objs):
+        """构造“约束项生效”的对象掩码。
+
+        约束默认对所有非 `__image__` 的对象生效；若配置了类别白名单，则只对名单内类别生效。
+        若配置了白名单但未提供 `objs`，则默认关闭约束（更安全，避免误伤）。
+        """
+        if self.constraint_class_ids is None:
+            return valid_mask
+        if objs is None:
+            return torch.zeros_like(valid_mask, dtype=torch.bool)
+        if len(self.constraint_class_ids) == 0:
+            return torch.zeros_like(valid_mask, dtype=torch.bool)
+
+        class_ids = torch.tensor(self.constraint_class_ids, device=objs.device, dtype=objs.dtype)
+        class_mask = (objs.long().unsqueeze(-1) == class_ids.long().view(*([1] * objs.dim()), -1)).any(dim=-1)
+        return valid_mask & class_mask
+
+    def forward(self, pred, target, objs=None, class_weights=None):
+        """计算基础损失 + 约束正则。
+
+        约束只对非 `__image__` 对象生效，并且仅在“超界/过小”时产生非零梯度。
+        """
+        pred_box = pred[..., :4].float()
+        target_box = target[..., :4].float()
+        pred_angle = pred[..., 4].float()
+        target_angle = target[..., 4].float()
+
+        if class_weights is not None and objs is not None:
+            w = class_weights[objs.long()].float()
+        else:
+            w = None
+
+        loc_diff = torch.abs(pred_box - target_box)
+        loc_loss_i = loc_diff.mean(dim=-1)
+
+        pred_w, pred_h = pred_box[..., 2], pred_box[..., 3]
+        tgt_w, tgt_h = target_box[..., 2], target_box[..., 3]
+        area_pred = pred_w * pred_h
+        area_tgt = tgt_w * tgt_h
+        area_l1_i = torch.abs(area_pred - area_tgt)
+        geom_i = loc_loss_i + 0.5 * area_l1_i
+
+        if w is not None:
+            geom_loss = (geom_i * w).sum() / (w.sum() + 1e-6)
+        else:
+            geom_loss = geom_i.mean()
+
+        image_mask = (target_box == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_box.device)).all(dim=-1)
+        valid_mask = ~image_mask
+
+        if valid_mask.any():
+            angle_diff = pred_angle[valid_mask] - target_angle[valid_mask]
+            base = (1 - torch.cos(angle_diff))
+            if w is not None:
+                wv = w[valid_mask]
+                angle_loss = (base * wv).sum() / (wv.sum() + 1e-6)
+            else:
+                angle_loss = base.mean()
+        else:
+            angle_loss = torch.tensor(0.0, device=target_box.device, dtype=geom_loss.dtype)
+
+        total = geom_loss + self.angle_weight * angle_loss
+
+        if self.constraint_weight != 0.0:
+            constraint_mask = self._build_constraint_mask(valid_mask, objs)
+            if constraint_mask.any():
+                # 仅对需要施加约束的对象计算惩罚项，避免天然长条类别被误伤
+                pw = torch.clamp(pred_w[constraint_mask], min=self.eps)
+                ph = torch.clamp(pred_h[constraint_mask], min=self.eps)
+
+                log_ratio = torch.log(pw) - torch.log(ph)
+                thr = torch.log(torch.tensor(self.ratio_max, device=pw.device, dtype=pw.dtype))
+                ratio_pen = torch.relu(torch.abs(log_ratio) - thr)
+
+                min_size_t = torch.tensor(self.min_size, device=pw.device, dtype=pw.dtype)
+                min_pen = torch.relu(min_size_t - pw) + torch.relu(min_size_t - ph)
+
+                pen_i = ratio_pen + min_pen
+                if w is not None:
+                    wv = w[constraint_mask]
+                    constraint_loss = (pen_i * wv).sum() / (wv.sum() + 1e-6)
+                else:
+                    constraint_loss = pen_i.mean()
+            else:
+                constraint_loss = torch.tensor(0.0, device=target_box.device, dtype=geom_loss.dtype)
+
+            total = total + self.constraint_weight * constraint_loss
+
+        return total
 
 class SameClassOverlapCriterion(nn.Module):
     def __init__(self):
