@@ -133,6 +133,16 @@ class Trainer:
                 os.makedirs(args.output_dir, exist_ok=True)
                 with open(f'{args.output_dir}/config.json', 'wt') as f:
                     json.dump(vars(args), f, indent=4)
+                # 尝试保存完整的脚本文件。
+                try:
+                    src_path = os.path.abspath(__file__)
+                    dst_path = os.path.join(args.output_dir, os.path.basename(src_path))
+                    with open(src_path, 'rt') as sf:
+                        code = sf.read()
+                    with open(dst_path, 'wt') as df:
+                        df.write(code)
+                except Exception as e:
+                    self.logger.warning(f"[init] failed to snapshot script: {e}")
 
         self.noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_diffusion_model_path, subfolder="scheduler")
         self.scheduler = PNDMScheduler.from_pretrained(args.pretrained_diffusion_model_path, subfolder="scheduler")
