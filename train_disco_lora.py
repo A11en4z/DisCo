@@ -35,14 +35,15 @@ from model.fusion import ObjectFusionTokenizer
 from model.cond_vae_lora import SceneVAEModel
 from model.attention_lora import register_attention_control_lora, get_lora_parameters, get_cma_small_parameters, attach_lora_layers
 from data_lora import build_train_dataloader
-from loss import VaeGaussCriterion, BoxL1ConstraintCriterion
+from loss import VaeGaussCriterion, BoxGWDCriterion
 
 
 def parse_args():
     """解析训练参数。
 
     该脚本仅在 `train_disco_lora.py` 中启用更强的布局约束（长宽比/最小尺寸），
-    以降低极端长条框与后期塌缩框的概率；原始训练脚本保持不变。
+    并使用 GWD(Gaussian Wasserstein Distance) 强化形状耦合约束，以降低“方形目标被预测成长条”的概率；
+    原始训练脚本保持不变。
     """
     parser = argparse.ArgumentParser(description="LoRA fine-tuning script for DisCo.")
     parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/gz-data/stable-diffusion-v1-5')
@@ -85,6 +86,11 @@ def parse_args():
     parser.add_argument("--box_ratio_max", type=float, default=3.0, help="最大允许长宽比（w/h 或 h/w）上限，超过后才开始惩罚",)
     parser.add_argument("--box_min_size", type=float, default=0.01, help="最小边长（归一化坐标）；小于该值会被惩罚以抑制后期塌缩",)
     parser.add_argument("--box_constraint_classes", type=str, default="baseballfield", help="仅对这些类别启用框约束（逗号分隔的类别名）；为空则对所有类别启用",)
+
+    # L1(center) + GWD(shape)：只对中心点用 L1，形状/角度用 GWD（避免对 w/h/angle 的逐维 L1）
+    parser.add_argument("--box_center_l1_weight", type=float, default=1.0, help="中心点 L1 权重（仅作用于 cx,cy）",)
+    parser.add_argument("--box_shape_gwd_weight", type=float, default=1.0, help="形状 GWD 权重（仅作用于 w,h,angle 的耦合项）",)
+    parser.add_argument("--box_gwd_use_sqrt", type=bool, default=True, help="对 shape 的 W2^2 取 sqrt，使量纲更接近 L1（更易调参）",)
     
     parser.add_argument("--vae_loss_weight", type=float, default=0.1)
     parser.add_argument("--box_loss_weight", type=float, default=1.0)
@@ -214,15 +220,18 @@ class Trainer:
                     constraint_class_ids.append(int(self.vocab["object_name_to_idx"][name]))
                 else:
                     self.logger.warning(f"[init] box_constraint_classes name not found in vocab: {name}")
-        self.box_criterion = BoxL1ConstraintCriterion(
-            angle_weight=self.args.angle_loss_weight,
+        self.box_criterion = BoxGWDCriterion(
+            center_l1_weight=self.args.box_center_l1_weight,
+            shape_gwd_weight=self.args.box_shape_gwd_weight,
+            use_sqrt=self.args.box_gwd_use_sqrt,
             constraint_weight=self.args.box_constraint_weight,
             ratio_max=self.args.box_ratio_max,
             min_size=self.args.box_min_size,
             constraint_class_ids=constraint_class_ids,
         )
-        # 注意：约束项通过 hinge 形式仅对“异常框”施加额外梯度，
-        # 默认权重很小，目标是不改变原有 box_loss 的主导分布。
+        # 核心说明：
+        # - GWD 对长宽比/角度的耦合更敏感，可抑制“方形目标预测成长条”的平均化失败；
+        # - 保留原有 hinge 约束项（ratio/min_size），仅对异常框提供额外梯度，降低退化解风险。
 
         lora_params = get_lora_parameters(self.unet)
         cma_params = get_cma_small_parameters(self.unet)

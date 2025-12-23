@@ -281,6 +281,186 @@ class BoxL1ConstraintCriterion(nn.Module):
 
         return total
 
+
+class BoxGWDCriterion(nn.Module):
+    """旋转框的 `L1(center) + GWD(shape)` 损失。
+
+    设计目标：
+    - 仅用 L1 约束中心点 `(cx, cy)`，保证布局位置稳定；
+    - 用 GWD 的“形状项”约束 `(w, h, angle)` 的耦合关系，抑制逐维 L1 的平均化倾向；
+    - 对多类别、多形态数据下的“正方形预测成长条”等宏观形变更敏感；
+    - 不再对 `w, h, angle` 计算逐维 L1，避免与 GWD 的形状梯度“打架”。
+
+    输入框格式：`[cx, cy, w, h, angle]`，均为归一化坐标，angle 为弧度。
+    其中 `w, h` 采用“长边在前”的约定（上游数据与 decoder 已做过 swap）。
+    """
+
+    def __init__(
+        self,
+        center_l1_weight: float = 1.0,
+        shape_gwd_weight: float = 1.0,
+        use_sqrt: bool = True,
+        eps: float = 1e-6,
+        constraint_weight: float = 0.0,
+        ratio_max: float = 10.0,
+        min_size: float = 0.01,
+        constraint_class_ids=None,
+    ):
+        """初始化 `L1(center) + GWD(shape)` 损失。
+
+        参数:
+        - center_l1_weight: 中心点 L1 权重（仅作用于 `cx,cy`）
+        - shape_gwd_weight: 形状 GWD 权重（仅作用于 `w,h,angle` 的耦合项）
+        - use_sqrt: True 时对 W2^2 取 sqrt，使量纲更接近 L1
+        - eps: 数值稳定项
+        - constraint_weight/ratio_max/min_size/constraint_class_ids: 可选退化约束（同 BoxL1ConstraintCriterion）
+        """
+        super().__init__()
+        self.center_l1_weight = float(center_l1_weight)
+        self.shape_gwd_weight = float(shape_gwd_weight)
+        self.use_sqrt = bool(use_sqrt)
+        self.eps = float(eps)
+
+        self.constraint_weight = float(constraint_weight)
+        self.ratio_max = float(ratio_max)
+        self.min_size = float(min_size)
+        if constraint_class_ids is None:
+            self.constraint_class_ids = None
+        else:
+            self.constraint_class_ids = [int(x) for x in constraint_class_ids]
+
+    def _build_constraint_mask(self, valid_mask, objs):
+        """构造“约束项生效”的对象掩码（与 BoxL1ConstraintCriterion 保持一致）。"""
+        if self.constraint_class_ids is None:
+            return valid_mask
+        if objs is None:
+            return torch.zeros_like(valid_mask, dtype=torch.bool)
+        if len(self.constraint_class_ids) == 0:
+            return torch.zeros_like(valid_mask, dtype=torch.bool)
+        class_ids = torch.tensor(self.constraint_class_ids, device=objs.device, dtype=objs.dtype)
+        class_mask = (objs.long().unsqueeze(-1) == class_ids.long().view(*([1] * objs.dim()), -1)).any(dim=-1)
+        return valid_mask & class_mask
+
+    def _sqrtm_psd_2x2(self, A: torch.Tensor) -> torch.Tensor:
+        """2x2 对称半正定矩阵的矩阵平方根：`sqrt(A)`。
+
+        通过 `eigh` 分解实现，保证可微与数值稳定（对特征值做 clamp）。
+        A: `[..., 2, 2]`
+        """
+        # 核心代码段：eigh + clamp，避免奇异协方差引发 NaN
+        evals, evecs = torch.linalg.eigh(A)
+        evals = torch.clamp(evals, min=self.eps)
+        sqrt_evals = torch.sqrt(evals)
+        return evecs @ torch.diag_embed(sqrt_evals) @ evecs.transpose(-1, -2)
+
+    def _boxes_to_gaussians(self, boxes: torch.Tensor):
+        """将旋转框映射为二维高斯分布参数 `(mu, Sigma)`。
+
+        约定：将矩形视为等密度区域的近似，用旋转后的对角协方差表达形状与角度耦合。
+        """
+        boxes_f = boxes.float()
+        mu = boxes_f[..., 0:2]
+        w = torch.clamp(boxes_f[..., 2], min=self.eps)
+        h = torch.clamp(boxes_f[..., 3], min=self.eps)
+        a = boxes_f[..., 4]
+
+        # 核心代码段：由 (w,h,theta) 构造协方差矩阵，角度差异会直接影响 Sigma
+        sx2 = (w * 0.5) ** 2
+        sy2 = (h * 0.5) ** 2
+        cos_t = torch.cos(a)
+        sin_t = torch.sin(a)
+
+        r00 = cos_t
+        r01 = -sin_t
+        r10 = sin_t
+        r11 = cos_t
+
+        # Sigma = R * diag(sx2, sy2) * R^T
+        s00 = r00 * r00 * sx2 + r01 * r01 * sy2
+        s01 = r00 * r10 * sx2 + r01 * r11 * sy2
+        s11 = r10 * r10 * sx2 + r11 * r11 * sy2
+
+        Sigma = torch.stack(
+            [torch.stack([s00, s01], dim=-1), torch.stack([s01, s11], dim=-1)],
+            dim=-2,
+        )
+        return mu, Sigma
+
+    def _gwd_shape_per_box(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """计算每个对象的 GWD 形状项（不做平均）。
+
+        仅保留 Bures 距离中的协方差项（shape term）：
+        `Tr(S_p + S_t - 2*(S_t^{1/2} S_p S_t^{1/2})^{1/2})`。
+        """
+        mu_p, S_p = self._boxes_to_gaussians(pred)
+        mu_t, S_t = self._boxes_to_gaussians(target)
+
+        _ = mu_p
+        _ = mu_t
+        sqrt_S_t = self._sqrtm_psd_2x2(S_t)
+        inner = sqrt_S_t @ S_p @ sqrt_S_t
+        sqrt_inner = self._sqrtm_psd_2x2(inner)
+
+        trace_term = torch.diagonal(S_p + S_t - 2.0 * sqrt_inner, dim1=-2, dim2=-1).sum(dim=-1)
+        w2 = torch.clamp(trace_term, min=0.0)
+        if self.use_sqrt:
+            return torch.sqrt(w2 + self.eps)
+        return w2
+
+    def forward(self, pred, target, objs=None, class_weights=None):
+        """计算 `L1(center) + GWD(shape)` 的最终 loss。
+
+        - 默认跳过 `__image__` 框（通过 target 的固定框识别）
+        - 支持 `class_weights[objs]` 的类别加权
+        """
+        pred_f = pred.float()
+        target_f = target.float()
+
+        image_mask = (target_f[..., :4] == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_f.device)).all(dim=-1)
+        valid_mask = ~image_mask
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
+
+        # 核心代码段：center 用 L1，shape 用 GWD（协方差项），避免 w/h/angle 的逐维 L1 参与训练
+        center_l1_i = torch.abs(pred_f[valid_mask, 0:2] - target_f[valid_mask, 0:2]).mean(dim=-1)
+        shape_gwd_i = self._gwd_shape_per_box(pred_f[valid_mask], target_f[valid_mask])
+
+        if class_weights is not None and objs is not None:
+            w = class_weights[objs.long()][valid_mask].float()
+        else:
+            w = None
+
+        if w is not None:
+            center_l1 = (center_l1_i * w).sum() / (w.sum() + self.eps)
+            shape_gwd = (shape_gwd_i * w).sum() / (w.sum() + self.eps)
+        else:
+            center_l1 = center_l1_i.mean()
+            shape_gwd = shape_gwd_i.mean()
+
+        total = self.center_l1_weight * center_l1 + self.shape_gwd_weight * shape_gwd
+
+        if self.constraint_weight != 0.0:
+            constraint_mask = self._build_constraint_mask(valid_mask, objs)
+            if constraint_mask.any():
+                pw = torch.clamp(pred_f[..., 2][constraint_mask], min=self.eps)
+                ph = torch.clamp(pred_f[..., 3][constraint_mask], min=self.eps)
+                log_ratio = torch.log(pw) - torch.log(ph)
+                thr = torch.log(torch.tensor(self.ratio_max, device=pw.device, dtype=pw.dtype))
+                ratio_pen = torch.relu(torch.abs(log_ratio) - thr)
+                min_size_t = torch.tensor(self.min_size, device=pw.device, dtype=pw.dtype)
+                min_pen = torch.relu(min_size_t - pw) + torch.relu(min_size_t - ph)
+                pen_i = ratio_pen + min_pen
+                if class_weights is not None and objs is not None:
+                    wv = class_weights[objs.long()][constraint_mask].float()
+                    constraint_loss = (pen_i * wv).sum() / (wv.sum() + self.eps)
+                else:
+                    constraint_loss = pen_i.mean()
+            else:
+                constraint_loss = torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
+            total = total + self.constraint_weight * constraint_loss
+
+        return total
+
 class SameClassOverlapCriterion(nn.Module):
     def __init__(self):
         super(SameClassOverlapCriterion, self).__init__()
