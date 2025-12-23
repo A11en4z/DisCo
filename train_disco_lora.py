@@ -80,31 +80,12 @@ def parse_args():
     parser.add_argument("--num_validation_images", type=int, default=8)
     parser.add_argument("--angle_loss_weight", type=float, default=1.0)
 
-    parser.add_argument(
-        "--box_constraint_weight",
-        type=float,
-        default=0.01,
-        help="约束正则权重 λ（建议很小；仅在异常框上起作用，避免影响原有 loss 分布）",
-    )
-    parser.add_argument(
-        "--box_ratio_max",
-        type=float,
-        default=10.0,
-        help="最大允许长宽比（w/h 或 h/w）上限，超过后才开始惩罚",
-    )
-    parser.add_argument(
-        "--box_min_size",
-        type=float,
-        default=0.01,
-        help="最小边长（归一化坐标）；小于该值会被惩罚以抑制后期塌缩",
-    )
-    parser.add_argument(
-        "--box_constraint_classes",
-        type=str,
-        default="baseballfield",
-        help="仅对这些类别启用框约束（逗号分隔的类别名）；为空则对所有类别启用",
-    )
-
+    # 辅助损失：类别特定尺寸约束
+    parser.add_argument("--box_constraint_weight", type=float, default=0.01, help="约束正则权重 λ（建议很小；仅在异常框上起作用，避免影响原有 loss 分布）",)
+    parser.add_argument("--box_ratio_max", type=float, default=3.0, help="最大允许长宽比（w/h 或 h/w）上限，超过后才开始惩罚",)
+    parser.add_argument("--box_min_size", type=float, default=0.01, help="最小边长（归一化坐标）；小于该值会被惩罚以抑制后期塌缩",)
+    parser.add_argument("--box_constraint_classes", type=str, default="baseballfield", help="仅对这些类别启用框约束（逗号分隔的类别名）；为空则对所有类别启用",)
+    
     parser.add_argument("--vae_loss_weight", type=float, default=0.1)
     parser.add_argument("--box_loss_weight", type=float, default=1.0)
     parser.add_argument("--diff_loss_weight", type=float, default=1.0)
