@@ -300,7 +300,7 @@ class BoxGWDCriterion(nn.Module):
         center_l1_weight: float = 1.0,
         shape_gwd_weight: float = 1.0,
         use_sqrt: bool = True,
-        eps: float = 1e-6,
+        eps: float = 1e-4,
         constraint_weight: float = 0.0,
         ratio_max: float = 10.0,
         min_size: float = 0.01,
@@ -341,17 +341,20 @@ class BoxGWDCriterion(nn.Module):
         class_mask = (objs.long().unsqueeze(-1) == class_ids.long().view(*([1] * objs.dim()), -1)).any(dim=-1)
         return valid_mask & class_mask
 
-    def _sqrtm_psd_2x2(self, A: torch.Tensor) -> torch.Tensor:
-        """2x2 对称半正定矩阵的矩阵平方根：`sqrt(A)`。
+    def _trace_2x2(self, A: torch.Tensor) -> torch.Tensor:
+        return A[..., 0, 0] + A[..., 1, 1]
 
-        通过 `eigh` 分解实现，保证可微与数值稳定（对特征值做 clamp）。
-        A: `[..., 2, 2]`
-        """
-        # 核心代码段：eigh + clamp，避免奇异协方差引发 NaN
-        evals, evecs = torch.linalg.eigh(A)
-        evals = torch.clamp(evals, min=self.eps)
-        sqrt_evals = torch.sqrt(evals)
-        return evecs @ torch.diag_embed(sqrt_evals) @ evecs.transpose(-1, -2)
+    def _det_2x2(self, A: torch.Tensor) -> torch.Tensor:
+        return A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0]
+
+    def _trace_symm_prod_2x2(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        a00 = A[..., 0, 0]
+        a01 = A[..., 0, 1]
+        a11 = A[..., 1, 1]
+        b00 = B[..., 0, 0]
+        b01 = B[..., 0, 1]
+        b11 = B[..., 1, 1]
+        return a00 * b00 + 2.0 * a01 * b01 + a11 * b11
 
     def _boxes_to_gaussians(self, boxes: torch.Tensor):
         """将旋转框映射为二维高斯分布参数 `(mu, Sigma)`。
@@ -392,17 +395,19 @@ class BoxGWDCriterion(nn.Module):
         仅保留 Bures 距离中的协方差项（shape term）：
         `Tr(S_p + S_t - 2*(S_t^{1/2} S_p S_t^{1/2})^{1/2})`。
         """
-        mu_p, S_p = self._boxes_to_gaussians(pred)
-        mu_t, S_t = self._boxes_to_gaussians(target)
+        _, S_p = self._boxes_to_gaussians(pred)
+        _, S_t = self._boxes_to_gaussians(target)
 
-        _ = mu_p
-        _ = mu_t
-        sqrt_S_t = self._sqrtm_psd_2x2(S_t)
-        inner = sqrt_S_t @ S_p @ sqrt_S_t
-        sqrt_inner = self._sqrtm_psd_2x2(inner)
+        tr_p = self._trace_2x2(S_p)
+        tr_t = self._trace_2x2(S_t)
 
-        trace_term = torch.diagonal(S_p + S_t - 2.0 * sqrt_inner, dim1=-2, dim2=-1).sum(dim=-1)
-        w2 = torch.clamp(trace_term, min=0.0)
+        tr_tp = self._trace_symm_prod_2x2(S_t, S_p)
+        det_p = torch.clamp(self._det_2x2(S_p), min=self.eps)
+        det_t = torch.clamp(self._det_2x2(S_t), min=self.eps)
+        sqrt_det = torch.sqrt(det_p * det_t + self.eps)
+
+        trace_sqrt = torch.sqrt(torch.clamp(tr_tp + 2.0 * sqrt_det, min=self.eps))
+        w2 = torch.clamp(tr_p + tr_t - 2.0 * trace_sqrt, min=0.0)
         if self.use_sqrt:
             return torch.sqrt(w2 + self.eps)
         return w2

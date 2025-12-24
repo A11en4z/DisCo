@@ -423,6 +423,12 @@ class Trainer:
                 diff_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + diff_loss * self.args.diff_loss_weight
 
+                if not torch.isfinite(loss):
+                    if self.accelerator.is_main_process:
+                        self.logger.warning(f"[train] non-finite loss detected, skip step. loss={loss.detach().item()}")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 log_loss += self.gather_loss(loss)
                 log_box_loss += self.gather_loss(box_loss)
                 log_box_center_l1 += self.gather_loss(box_center_l1)
@@ -435,6 +441,8 @@ class Trainer:
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(self.unet.parameters(), self.args.max_grad_norm)
+                    self.accelerator.clip_grad_norm_(self.sl_vae.parameters(), self.args.max_grad_norm)
+                    self.accelerator.clip_grad_norm_(self.object_fusion_tokenizer.parameters(), self.args.max_grad_norm)
 
                 self.lr_scheduler.step()
                 self.optimizer.step()
