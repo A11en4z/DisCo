@@ -359,6 +359,10 @@ class Trainer:
     def train_one_epoch(self, epoch):
         log_loss = 0.0
         log_box_loss = 0.0
+        log_box_center_l1 = 0.0
+        log_box_shape_gwd = 0.0
+        log_box_constraint_pen = 0.0
+        log_box_constraint_loss = 0.0
         log_vae_loss = 0.0
         log_diff_loss = 0.0
         if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
@@ -389,11 +393,42 @@ class Trainer:
 
                 vae_loss = self.vae_criterion(mu, logvar)
                 box_loss = self.box_criterion(layout_pred, layout, objs=objs)
+                pred_f = layout_pred.float()
+                target_f = layout.float()
+                image_mask = (target_f[..., :4] == torch.tensor([0.5, 0.5, 1.0, 1.0], device=target_f.device)).all(dim=-1)
+                valid_mask = ~image_mask
+                if valid_mask.any():
+                    box_center_l1 = torch.abs(pred_f[valid_mask, 0:2] - target_f[valid_mask, 0:2]).mean(dim=-1).mean()
+                    box_shape_gwd = self.box_criterion._gwd_shape_per_box(pred_f[valid_mask], target_f[valid_mask]).mean()
+                else:
+                    box_center_l1 = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+                    box_shape_gwd = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+
+                if float(self.args.box_constraint_weight) != 0.0 and valid_mask.any():
+                    constraint_mask = self.box_criterion._build_constraint_mask(valid_mask, objs)
+                    if constraint_mask.any():
+                        pw = torch.clamp(pred_f[..., 2][constraint_mask], min=self.box_criterion.eps)
+                        ph = torch.clamp(pred_f[..., 3][constraint_mask], min=self.box_criterion.eps)
+                        log_ratio = torch.log(pw) - torch.log(ph)
+                        thr = torch.log(torch.tensor(self.args.box_ratio_max, device=pw.device, dtype=pw.dtype))
+                        ratio_pen = torch.relu(torch.abs(log_ratio) - thr)
+                        min_size_t = torch.tensor(self.args.box_min_size, device=pw.device, dtype=pw.dtype)
+                        min_pen = torch.relu(min_size_t - pw) + torch.relu(min_size_t - ph)
+                        box_constraint_pen = (ratio_pen + min_pen).mean()
+                    else:
+                        box_constraint_pen = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+                else:
+                    box_constraint_pen = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+                box_constraint_loss = box_constraint_pen * float(self.args.box_constraint_weight)
                 diff_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
                 loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + diff_loss * self.args.diff_loss_weight
 
                 log_loss += self.gather_loss(loss)
                 log_box_loss += self.gather_loss(box_loss)
+                log_box_center_l1 += self.gather_loss(box_center_l1)
+                log_box_shape_gwd += self.gather_loss(box_shape_gwd)
+                log_box_constraint_pen += self.gather_loss(box_constraint_pen)
+                log_box_constraint_loss += self.gather_loss(box_constraint_loss)
                 log_vae_loss += self.gather_loss(vae_loss)
                 log_diff_loss += self.gather_loss(diff_loss)
 
@@ -412,11 +447,22 @@ class Trainer:
                 self.global_step += 1
                 self.accelerator.log({"train_loss": log_loss}, step=self.global_step)
                 self.accelerator.log({"box_loss": log_box_loss}, step=self.global_step)
+                self.accelerator.log({"box_center_l1": log_box_center_l1}, step=self.global_step)
+                self.accelerator.log({"box_shape_gwd": log_box_shape_gwd}, step=self.global_step)
+                self.accelerator.log({"box_constraint_pen": log_box_constraint_pen}, step=self.global_step)
+                self.accelerator.log({"box_constraint_loss": log_box_constraint_loss}, step=self.global_step)
                 self.accelerator.log({"vae_loss": log_vae_loss}, step=self.global_step)
                 self.accelerator.log({"diff_loss": log_diff_loss}, step=self.global_step)
+                self.accelerator.log({"weighted_box_loss": log_box_loss * float(self.args.box_loss_weight)}, step=self.global_step)
+                self.accelerator.log({"weighted_vae_loss": log_vae_loss * float(self.args.vae_loss_weight)}, step=self.global_step)
+                self.accelerator.log({"weighted_diff_loss": log_diff_loss * float(self.args.diff_loss_weight)}, step=self.global_step)
                 self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]}, step=self.global_step)
                 log_loss = 0.0
                 log_box_loss = 0.0
+                log_box_center_l1 = 0.0
+                log_box_shape_gwd = 0.0
+                log_box_constraint_pen = 0.0
+                log_box_constraint_loss = 0.0
                 log_vae_loss = 0.0
                 log_diff_loss = 0.0
 
