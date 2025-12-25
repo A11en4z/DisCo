@@ -298,7 +298,10 @@ class BoxGWDCriterion(nn.Module):
     def __init__(
         self,
         center_l1_weight: float = 1.0,
+        size_l1_weight: float = 0.0,
+        use_log_size: bool = True,
         shape_gwd_weight: float = 1.0,
+        angle_weight: float = 0.0,
         use_sqrt: bool = True,
         eps: float = 1e-4,
         constraint_weight: float = 0.0,
@@ -317,7 +320,10 @@ class BoxGWDCriterion(nn.Module):
         """
         super().__init__()
         self.center_l1_weight = float(center_l1_weight)
+        self.size_l1_weight = float(size_l1_weight)
+        self.use_log_size = bool(use_log_size)
         self.shape_gwd_weight = float(shape_gwd_weight)
+        self.angle_weight = float(angle_weight)
         self.use_sqrt = bool(use_sqrt)
         self.eps = float(eps)
 
@@ -430,6 +436,25 @@ class BoxGWDCriterion(nn.Module):
         center_l1_i = torch.abs(pred_f[valid_mask, 0:2] - target_f[valid_mask, 0:2]).mean(dim=-1)
         shape_gwd_i = self._gwd_shape_per_box(pred_f[valid_mask], target_f[valid_mask])
 
+        if self.size_l1_weight != 0.0:
+            pw = torch.clamp(pred_f[valid_mask, 2], min=self.eps)
+            ph = torch.clamp(pred_f[valid_mask, 3], min=self.eps)
+            tw = torch.clamp(target_f[valid_mask, 2], min=self.eps)
+            th = torch.clamp(target_f[valid_mask, 3], min=self.eps)
+            if self.use_log_size:
+                size_l1_i = (torch.abs(torch.log(pw) - torch.log(tw)) + torch.abs(torch.log(ph) - torch.log(th))) * 0.5
+            else:
+                size_l1_i = (torch.abs(pw - tw) + torch.abs(ph - th)) * 0.5
+        else:
+            size_l1_i = None
+
+        if self.angle_weight != 0.0:
+            pred_a = pred_f[valid_mask, 4]
+            tgt_a = target_f[valid_mask, 4]
+            angle_l_i = 1.0 - torch.cos(pred_a - tgt_a)
+        else:
+            angle_l_i = None
+
         if class_weights is not None and objs is not None:
             w = class_weights[objs.long()][valid_mask].float()
         else:
@@ -438,11 +463,26 @@ class BoxGWDCriterion(nn.Module):
         if w is not None:
             center_l1 = (center_l1_i * w).sum() / (w.sum() + self.eps)
             shape_gwd = (shape_gwd_i * w).sum() / (w.sum() + self.eps)
+            if size_l1_i is not None:
+                size_l1 = (size_l1_i * w).sum() / (w.sum() + self.eps)
+            else:
+                size_l1 = torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
+            if angle_l_i is not None:
+                angle_l = (angle_l_i * w).sum() / (w.sum() + self.eps)
+            else:
+                angle_l = torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
         else:
             center_l1 = center_l1_i.mean()
             shape_gwd = shape_gwd_i.mean()
+            size_l1 = size_l1_i.mean() if size_l1_i is not None else torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
+            angle_l = angle_l_i.mean() if angle_l_i is not None else torch.tensor(0.0, device=target_f.device, dtype=target_f.dtype)
 
-        total = self.center_l1_weight * center_l1 + self.shape_gwd_weight * shape_gwd
+        total = (
+            self.center_l1_weight * center_l1
+            + self.size_l1_weight * size_l1
+            + self.shape_gwd_weight * shape_gwd
+            + self.angle_weight * angle_l
+        )
 
         if self.constraint_weight != 0.0:
             constraint_mask = self._build_constraint_mask(valid_mask, objs)

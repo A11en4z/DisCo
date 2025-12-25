@@ -89,6 +89,8 @@ def parse_args():
 
     # L1(center) + GWD(shape)：只对中心点用 L1，形状/角度用 GWD（避免对 w/h/angle 的逐维 L1）
     parser.add_argument("--box_center_l1_weight", type=float, default=1.0, help="中心点 L1 权重（仅作用于 cx,cy）",)
+    parser.add_argument("--box_size_l1_weight", type=float, default=0.5, help="尺寸 L1 权重（仅作用于 w,h；用于训练早期稳定长宽比）",)
+    parser.add_argument("--box_use_log_size", type=bool, default=True, help="对尺寸 L1 使用 log(w),log(h)（尺度更稳）",)
     parser.add_argument("--box_shape_gwd_weight", type=float, default=1.0, help="形状 GWD 权重（仅作用于 w,h,angle 的耦合项）",)
     parser.add_argument("--box_gwd_use_sqrt", type=bool, default=True, help="对 shape 的 W2^2 取 sqrt，使量纲更接近 L1（更易调参）",)
     
@@ -222,7 +224,10 @@ class Trainer:
                     self.logger.warning(f"[init] box_constraint_classes name not found in vocab: {name}")
         self.box_criterion = BoxGWDCriterion(
             center_l1_weight=self.args.box_center_l1_weight,
+            size_l1_weight=self.args.box_size_l1_weight,
+            use_log_size=self.args.box_use_log_size,
             shape_gwd_weight=self.args.box_shape_gwd_weight,
+            angle_weight=self.args.angle_loss_weight,
             use_sqrt=self.args.box_gwd_use_sqrt,
             constraint_weight=self.args.box_constraint_weight,
             ratio_max=self.args.box_ratio_max,
@@ -360,7 +365,9 @@ class Trainer:
         log_loss = 0.0
         log_box_loss = 0.0
         log_box_center_l1 = 0.0
+        log_box_size_l1 = 0.0
         log_box_shape_gwd = 0.0
+        log_box_angle_loss = 0.0
         log_box_constraint_pen = 0.0
         log_box_constraint_loss = 0.0
         log_vae_loss = 0.0
@@ -399,10 +406,21 @@ class Trainer:
                 valid_mask = ~image_mask
                 if valid_mask.any():
                     box_center_l1 = torch.abs(pred_f[valid_mask, 0:2] - target_f[valid_mask, 0:2]).mean(dim=-1).mean()
+                    pw = torch.clamp(pred_f[valid_mask, 2], min=self.box_criterion.eps)
+                    ph = torch.clamp(pred_f[valid_mask, 3], min=self.box_criterion.eps)
+                    tw = torch.clamp(target_f[valid_mask, 2], min=self.box_criterion.eps)
+                    th = torch.clamp(target_f[valid_mask, 3], min=self.box_criterion.eps)
+                    if bool(self.args.box_use_log_size):
+                        box_size_l1 = ((torch.abs(torch.log(pw) - torch.log(tw)) + torch.abs(torch.log(ph) - torch.log(th))) * 0.5).mean()
+                    else:
+                        box_size_l1 = ((torch.abs(pw - tw) + torch.abs(ph - th)) * 0.5).mean()
                     box_shape_gwd = self.box_criterion._gwd_shape_per_box(pred_f[valid_mask], target_f[valid_mask]).mean()
+                    box_angle_loss = (1.0 - torch.cos(pred_f[valid_mask, 4] - target_f[valid_mask, 4])).mean()
                 else:
                     box_center_l1 = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+                    box_size_l1 = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
                     box_shape_gwd = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
+                    box_angle_loss = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
 
                 if float(self.args.box_constraint_weight) != 0.0 and valid_mask.any():
                     constraint_mask = self.box_criterion._build_constraint_mask(valid_mask, objs)
@@ -432,7 +450,9 @@ class Trainer:
                 log_loss += self.gather_loss(loss)
                 log_box_loss += self.gather_loss(box_loss)
                 log_box_center_l1 += self.gather_loss(box_center_l1)
+                log_box_size_l1 += self.gather_loss(box_size_l1)
                 log_box_shape_gwd += self.gather_loss(box_shape_gwd)
+                log_box_angle_loss += self.gather_loss(box_angle_loss)
                 log_box_constraint_pen += self.gather_loss(box_constraint_pen)
                 log_box_constraint_loss += self.gather_loss(box_constraint_loss)
                 log_vae_loss += self.gather_loss(vae_loss)
@@ -456,7 +476,9 @@ class Trainer:
                 self.accelerator.log({"train_loss": log_loss}, step=self.global_step)
                 self.accelerator.log({"box_loss": log_box_loss}, step=self.global_step)
                 self.accelerator.log({"box_center_l1": log_box_center_l1}, step=self.global_step)
+                self.accelerator.log({"box_size_l1": log_box_size_l1}, step=self.global_step)
                 self.accelerator.log({"box_shape_gwd": log_box_shape_gwd}, step=self.global_step)
+                self.accelerator.log({"box_angle_loss": log_box_angle_loss}, step=self.global_step)
                 self.accelerator.log({"box_constraint_pen": log_box_constraint_pen}, step=self.global_step)
                 self.accelerator.log({"box_constraint_loss": log_box_constraint_loss}, step=self.global_step)
                 self.accelerator.log({"vae_loss": log_vae_loss}, step=self.global_step)
@@ -468,7 +490,9 @@ class Trainer:
                 log_loss = 0.0
                 log_box_loss = 0.0
                 log_box_center_l1 = 0.0
+                log_box_size_l1 = 0.0
                 log_box_shape_gwd = 0.0
+                log_box_angle_loss = 0.0
                 log_box_constraint_pen = 0.0
                 log_box_constraint_loss = 0.0
                 log_vae_loss = 0.0
