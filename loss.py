@@ -600,6 +600,387 @@ class SameClassOverlapCriterion(nn.Module):
             return torch.tensor(0.0, device=pred.device)
         return total / count
 
+
+class RelationConsistencyCriterion(nn.Module):
+    """关系一致性损失：用几何约束补齐“拓扑关系”的监督空白。
+
+    目标：
+    - 对 inside/contains 关系施加“严格包含”约束（角点不越界），解决“中心在里但框越界”的问题；
+    - 对指定的父子类别对施加角度同步约束（例如 stadium-groundtrackfield）；
+    - 对未被允许重叠的对象对施加排斥（IoU 过大惩罚），抑制不合理重叠/交叉。
+
+    注意：
+    - 该模块默认只输出三个“原始项”（inside_violation / angle_align / repulsion），权重由训练脚本外部控制，
+      以避免破坏现有 loss 的优化结构与尺度分布。
+    - 所有几何计算在 float32 下进行，避免 bf16/fp16 下的三角函数与 clamp 导致的数值不稳定。
+    """
+
+    def __init__(
+        self,
+        inside_pred_ids=None,
+        contains_pred_ids=None,
+        overlap_allowed_pred_ids=None,
+        angle_align_pairs=None,
+        image_obj_idx: int = 0,
+        repulsion_iou_thr: float = 0.1,
+        repulsion_aabb_prefilter_thr: float = 0.02,
+        repulsion_theta_eps: float = 0.087,
+        repulsion_apply_same_class: bool = True,
+        repulsion_apply_diff_class: bool = True,
+        repulsion_min_area: float = 0.0,
+        repulsion_exempt_class_ids=None,
+        eps: float = 1e-6,
+    ):
+        """初始化关系一致性损失。
+
+        参数:
+        - inside_pred_ids: 表示“subject 在 object 内部”的谓词 id 列表/集合
+        - contains_pred_ids: 表示“subject 包含 object（等价于 object inside subject）”的谓词 id 列表/集合
+        - overlap_allowed_pred_ids: 允许重叠的谓词 id 列表/集合（用于 repulsion 过滤）
+        - angle_align_pairs: 角度同步的 (child_class_id, parent_class_id) 列表/集合；None/空则关闭该项
+        - image_obj_idx: __image__ 的类别 id（用于跳过）
+        - repulsion_iou_thr: repulsion 的 IoU 阈值（超过后才惩罚）
+        - repulsion_apply_same_class/repulsion_apply_diff_class: 是否对同类/异类对启用 repulsion
+        - repulsion_min_area: 面积小于该阈值的框不参与 repulsion（归一化坐标）
+        - repulsion_exempt_class_ids: 免疫 repulsion 的类别 id 列表/集合（例如 sky/grass 等可大面积覆盖类）
+        - eps: 数值稳定项
+        """
+        super().__init__()
+        self.inside_pred_ids = set(int(x) for x in (inside_pred_ids or []))
+        self.contains_pred_ids = set(int(x) for x in (contains_pred_ids or []))
+        self.overlap_allowed_pred_ids = set(int(x) for x in (overlap_allowed_pred_ids or []))
+        self.angle_align_pairs = set((int(a), int(b)) for (a, b) in (angle_align_pairs or []))
+        self.image_obj_idx = int(image_obj_idx)
+        self.repulsion_iou_thr = float(repulsion_iou_thr)
+        self.repulsion_aabb_prefilter_thr = float(repulsion_aabb_prefilter_thr)
+        self.repulsion_theta_eps = float(repulsion_theta_eps)
+        self.repulsion_apply_same_class = bool(repulsion_apply_same_class)
+        self.repulsion_apply_diff_class = bool(repulsion_apply_diff_class)
+        self.repulsion_min_area = float(repulsion_min_area)
+        self.repulsion_exempt_class_ids = set(int(x) for x in (repulsion_exempt_class_ids or []))
+        self.eps = float(eps)
+
+    def _obb_corners(self, boxes: torch.Tensor) -> torch.Tensor:
+        """将旋转框转换为四个角点坐标。
+
+        输入:
+        - boxes: `[..., 5]`，格式 `[cx, cy, w, h, angle]`（归一化坐标，angle 为弧度）
+        输出:
+        - corners: `[..., 4, 2]`，角点顺序为 (-x,-y), (-x,+y), (+x,+y), (+x,-y)
+        """
+        b = boxes.float()
+        cx, cy = b[..., 0], b[..., 1]
+        w = torch.clamp(b[..., 2], min=self.eps)
+        h = torch.clamp(b[..., 3], min=self.eps)
+        a = b[..., 4]
+
+        dx = 0.5 * w
+        dy = 0.5 * h
+        rel = torch.stack(
+            [
+                torch.stack([-dx, -dy], dim=-1),
+                torch.stack([-dx, dy], dim=-1),
+                torch.stack([dx, dy], dim=-1),
+                torch.stack([dx, -dy], dim=-1),
+            ],
+            dim=-2,
+        )
+
+        cos_t = torch.cos(a)[..., None]
+        sin_t = torch.sin(a)[..., None]
+
+        x = rel[..., 0]
+        y = rel[..., 1]
+        rx = x * cos_t - y * sin_t
+        ry = x * sin_t + y * cos_t
+
+        corners = torch.stack([rx + cx[..., None], ry + cy[..., None]], dim=-1)
+        return corners
+
+    def _inside_violation_per_pair(self, child_boxes: torch.Tensor, parent_boxes: torch.Tensor) -> torch.Tensor:
+        """计算每对 (child inside parent) 的越界惩罚（不做平均）。"""
+        child = child_boxes.float()
+        parent = parent_boxes.float()
+
+        pcx, pcy = parent[..., 0], parent[..., 1]
+        pw = torch.clamp(parent[..., 2], min=self.eps)
+        ph = torch.clamp(parent[..., 3], min=self.eps)
+        pa = parent[..., 4]
+
+        corners = self._obb_corners(child)  # [K,4,2]
+
+        dx = corners[..., 0] - pcx[..., None]
+        dy = corners[..., 1] - pcy[..., None]
+
+        cos_p = torch.cos(pa)[..., None]
+        sin_p = torch.sin(pa)[..., None]
+
+        # 核心代码段：将 child 角点变换到 parent 局部坐标系（等价于 R(-pa)）
+        lx = dx * cos_p + dy * sin_p
+        ly = -dx * sin_p + dy * cos_p
+
+        ox = torch.relu(torch.abs(lx) - 0.5 * pw[..., None])
+        oy = torch.relu(torch.abs(ly) - 0.5 * ph[..., None])
+        viol = ox + oy  # [K,4]
+        return viol.mean(dim=-1)  # [K]
+
+    def _angle_align_per_pair(self, child_boxes: torch.Tensor, parent_boxes: torch.Tensor) -> torch.Tensor:
+        """计算每对 (child,parent) 的角度差异惩罚（不做平均）。"""
+        ca = child_boxes.float()[..., 4]
+        pa = parent_boxes.float()[..., 4]
+        return 1.0 - torch.cos(ca - pa)
+
+    def _aabb_iou_matrix(self, boxes: torch.Tensor) -> torch.Tensor:
+        """AABB IoU 矩阵（忽略角度），用于 repulsion 的低开销近似。"""
+        b = boxes.float()
+        cx, cy = b[:, 0], b[:, 1]
+        w = torch.clamp(b[:, 2], min=self.eps)
+        h = torch.clamp(b[:, 3], min=self.eps)
+        x0 = cx - 0.5 * w
+        y0 = cy - 0.5 * h
+        x1 = cx + 0.5 * w
+        y1 = cy + 0.5 * h
+
+        xx0 = torch.maximum(x0[:, None], x0[None, :])
+        yy0 = torch.maximum(y0[:, None], y0[None, :])
+        xx1 = torch.minimum(x1[:, None], x1[None, :])
+        yy1 = torch.minimum(y1[:, None], y1[None, :])
+
+        inter_w = torch.clamp(xx1 - xx0, min=0.0)
+        inter_h = torch.clamp(yy1 - yy0, min=0.0)
+        inter = inter_w * inter_h
+
+        area = (x1 - x0) * (y1 - y0)
+        union = area[:, None] + area[None, :] - inter + self.eps
+        return inter / union
+
+    def _oriented_iou_pairs(self, boxes: torch.Tensor, i: torch.Tensor, j: torch.Tensor, aabb_iou_ij: torch.Tensor) -> torch.Tensor:
+        """计算候选对象对的“旋转近似 IoU”（不构造 NxN 矩阵）。"""
+        b = boxes.float()
+        i = i.long()
+        j = j.long()
+
+        cxi = b[i, 0]
+        cyi = b[i, 1]
+        wi = torch.clamp(b[i, 2], min=self.eps)
+        hi = torch.clamp(b[i, 3], min=self.eps)
+        ai = b[i, 4]
+
+        cxj = b[j, 0]
+        cyj = b[j, 1]
+        wj = torch.clamp(b[j, 2], min=self.eps)
+        hj = torch.clamp(b[j, 3], min=self.eps)
+        aj = b[j, 4]
+
+        da = torch.abs(ai - aj)
+        theta_eps = torch.tensor(self.repulsion_theta_eps, device=b.device, dtype=b.dtype)
+        use_aabb = da < theta_eps
+
+        theta_avg = 0.5 * (ai + aj)
+        cos_t = torch.cos(theta_avg)
+        sin_t = torch.sin(theta_avg)
+
+        dx = cxj - cxi
+        dy = cyj - cyi
+        du = torch.abs(dx * cos_t + dy * sin_t)
+        dv = torch.abs(-dx * sin_t + dy * cos_t)
+
+        dti = ai - theta_avg
+        dtj = aj - theta_avg
+
+        hu_i = torch.abs((wi * 0.5) * torch.cos(dti)) + torch.abs((hi * 0.5) * torch.sin(dti))
+        hv_i = torch.abs((wi * 0.5) * torch.sin(dti)) + torch.abs((hi * 0.5) * torch.cos(dti))
+        hu_j = torch.abs((wj * 0.5) * torch.cos(dtj)) + torch.abs((hj * 0.5) * torch.sin(dtj))
+        hv_j = torch.abs((wj * 0.5) * torch.sin(dtj)) + torch.abs((hj * 0.5) * torch.cos(dtj))
+
+        lu = torch.clamp(hu_i + hu_j - du, min=0.0)
+        lv = torch.clamp(hv_i + hv_j - dv, min=0.0)
+        inter = lu * lv
+
+        area_i = wi * hi
+        area_j = wj * hj
+        union = area_i + area_j - inter + self.eps
+        iou_oriented = inter / union
+
+        return torch.where(use_aabb, aabb_iou_ij, iou_oriented)
+
+    def forward(self, pred, objs, triples, obj_to_img, triple_to_img):
+        """计算关系一致性损失的三个原始项（不含外部权重）。"""
+        device = pred.device
+        dtype = pred.dtype
+
+        inside_violation = torch.tensor(0.0, device=device, dtype=dtype)
+        angle_align = torch.tensor(0.0, device=device, dtype=dtype)
+        repulsion = torch.tensor(0.0, device=device, dtype=dtype)
+
+        if pred.numel() == 0:
+            return {
+                "inside_violation": inside_violation,
+                "angle_align": angle_align,
+                "repulsion": repulsion,
+            }
+
+        pred_f = pred.float()
+        objs_l = objs.long()
+
+        # 正向约束：inside / contains
+        if triples is not None and triples.numel() > 0 and (len(self.inside_pred_ids) > 0 or len(self.contains_pred_ids) > 0):
+            s_idx, p_idx, o_idx = triples.chunk(3, dim=1)
+            s_idx = s_idx.squeeze(1).long()
+            p_idx = p_idx.squeeze(1).long()
+            o_idx = o_idx.squeeze(1).long()
+
+            if len(self.inside_pred_ids) > 0:
+                inside_mask = torch.zeros_like(p_idx, dtype=torch.bool)
+                for pid in self.inside_pred_ids:
+                    inside_mask = inside_mask | (p_idx == pid)
+            else:
+                inside_mask = torch.zeros_like(p_idx, dtype=torch.bool)
+
+            if len(self.contains_pred_ids) > 0:
+                contains_mask = torch.zeros_like(p_idx, dtype=torch.bool)
+                for pid in self.contains_pred_ids:
+                    contains_mask = contains_mask | (p_idx == pid)
+            else:
+                contains_mask = torch.zeros_like(p_idx, dtype=torch.bool)
+
+            pair_s = torch.cat([s_idx[inside_mask], o_idx[contains_mask]], dim=0)
+            pair_o = torch.cat([o_idx[inside_mask], s_idx[contains_mask]], dim=0)
+
+            if pair_s.numel() > 0:
+                valid_pair = (objs_l[pair_s] != self.image_obj_idx) & (objs_l[pair_o] != self.image_obj_idx)
+                pair_s = pair_s[valid_pair]
+                pair_o = pair_o[valid_pair]
+
+            if pair_s.numel() > 0:
+                child_b = pred_f[pair_s]
+                parent_b = pred_f[pair_o]
+                viol_i = self._inside_violation_per_pair(child_b, parent_b)
+                inside_violation = viol_i.mean().to(dtype=dtype)
+
+                if len(self.angle_align_pairs) > 0:
+                    c_cls = objs_l[pair_s]
+                    p_cls = objs_l[pair_o]
+                    align_mask = torch.zeros_like(c_cls, dtype=torch.bool)
+                    for (cc, pc) in self.angle_align_pairs:
+                        align_mask = align_mask | ((c_cls == cc) & (p_cls == pc))
+                    if align_mask.any():
+                        ang_i = self._angle_align_per_pair(child_b[align_mask], parent_b[align_mask])
+                        angle_align = ang_i.mean().to(dtype=dtype)
+
+        # 负向约束：repulsion（对未被允许重叠的对象对，惩罚过大 IoU）
+        if obj_to_img is not None and obj_to_img.numel() == objs_l.numel() and (self.repulsion_apply_same_class or self.repulsion_apply_diff_class):
+            imgs = obj_to_img.long()
+            rep_count = 0.0
+            for img_id in imgs.unique().tolist():
+                mask = imgs == img_id
+                idx = mask.nonzero().view(-1)
+                if idx.numel() <= 1:
+                    continue
+
+                cls = objs_l[idx]
+                keep = cls != self.image_obj_idx
+                idx = idx[keep]
+                cls = cls[keep]
+                if idx.numel() <= 1:
+                    continue
+
+                if len(self.repulsion_exempt_class_ids) > 0:
+                    ex = torch.zeros_like(cls, dtype=torch.bool)
+                    for cid in self.repulsion_exempt_class_ids:
+                        ex = ex | (cls == cid)
+                    if ex.all():
+                        continue
+
+                b = pred_f[idx]
+                iou_aabb = self._aabb_iou_matrix(b)  # [n,n]
+
+                n = idx.numel()
+                upper = torch.triu(torch.ones((n, n), device=device, dtype=torch.bool), diagonal=1)
+
+                if not self.repulsion_apply_same_class:
+                    upper = upper & (cls[:, None] != cls[None, :])
+                if not self.repulsion_apply_diff_class:
+                    upper = upper & (cls[:, None] == cls[None, :])
+
+                if len(self.repulsion_exempt_class_ids) > 0:
+                    ex = torch.zeros_like(cls, dtype=torch.bool)
+                    for cid in self.repulsion_exempt_class_ids:
+                        ex = ex | (cls == cid)
+                    upper = upper & (~ex[:, None]) & (~ex[None, :])
+
+                if self.repulsion_min_area > 0.0:
+                    area = torch.clamp(b[:, 2], min=self.eps) * torch.clamp(b[:, 3], min=self.eps)
+                    big = area >= self.repulsion_min_area
+                    upper = upper & big[:, None] & big[None, :]
+
+                if triples is not None and triples.numel() > 0 and triple_to_img is not None and triple_to_img.numel() == triples.shape[0] and len(self.overlap_allowed_pred_ids) > 0:
+                    rel_mask = triple_to_img.long() == img_id
+                    if rel_mask.any():
+                        t = triples[rel_mask]
+                        s_idx, p_idx, o_idx = t.chunk(3, dim=1)
+                        s_idx = s_idx.squeeze(1).long()
+                        p_idx = p_idx.squeeze(1).long()
+                        o_idx = o_idx.squeeze(1).long()
+                        allow = torch.zeros_like(p_idx, dtype=torch.bool)
+                        for pid in self.overlap_allowed_pred_ids:
+                            allow = allow | (p_idx == pid)
+                        if allow.any():
+                            s_allowed = s_idx[allow]
+                            o_allowed = o_idx[allow]
+
+                            # 核心代码段：将允许重叠的对象对从 repulsion 掩码中剔除（无向对）
+                            global_to_local = {int(idx[i].item()): i for i in range(n)}
+                            u = []
+                            v = []
+                            for gs, go in zip(s_allowed.tolist(), o_allowed.tolist()):
+                                ls = global_to_local.get(int(gs), None)
+                                lo = global_to_local.get(int(go), None)
+                                if ls is None or lo is None:
+                                    continue
+                                if ls == lo:
+                                    continue
+                                a = min(ls, lo)
+                                b2 = max(ls, lo)
+                                u.append(a)
+                                v.append(b2)
+                            if len(u) > 0:
+                                upper[torch.tensor(u, device=device), torch.tensor(v, device=device)] = False
+
+                if not upper.any():
+                    continue
+
+                thr = torch.tensor(self.repulsion_iou_thr, device=device, dtype=iou_aabb.dtype)
+                thr = torch.clamp(thr, min=0.0, max=0.99)
+                pre_thr_v = min(float(self.repulsion_aabb_prefilter_thr), float(self.repulsion_iou_thr))
+                pre_thr = torch.tensor(pre_thr_v, device=device, dtype=iou_aabb.dtype)
+                pre_thr = torch.clamp(pre_thr, min=0.0, max=0.99)
+
+                cand = upper & (iou_aabb > pre_thr)
+                if not cand.any():
+                    continue
+
+                pair = cand.nonzero(as_tuple=False)
+                ii = pair[:, 0]
+                jj = pair[:, 1]
+                aabb_ij = iou_aabb[ii, jj]
+                iou_ij = self._oriented_iou_pairs(b, ii, jj, aabb_ij)
+
+                hinge = torch.relu(iou_ij - thr)
+                penalty = (hinge / (1.0 - thr + self.eps)) ** 2
+                rep_i = penalty.mean().to(dtype=dtype)
+                repulsion = repulsion + rep_i
+                rep_count += 1.0
+
+            if rep_count > 0.0:
+                repulsion = repulsion / rep_count
+
+        return {
+            "inside_violation": inside_violation,
+            "angle_align": angle_align,
+            "repulsion": repulsion,
+        }
+
 class CategoryPriorCriterion(nn.Module):
     def __init__(self):
         super(CategoryPriorCriterion, self).__init__()

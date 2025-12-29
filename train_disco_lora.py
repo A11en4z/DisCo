@@ -35,7 +35,7 @@ from model.fusion import ObjectFusionTokenizer
 from model.cond_vae_lora import SceneVAEModel
 from model.attention_lora import register_attention_control_lora, get_lora_parameters, get_cma_small_parameters, attach_lora_layers
 from data_lora import build_train_dataloader
-from loss import VaeGaussCriterion, BoxGWDCriterion
+from loss import VaeGaussCriterion, BoxGWDCriterion, RelationConsistencyCriterion
 
 
 def parse_args():
@@ -93,6 +93,22 @@ def parse_args():
     parser.add_argument("--box_use_log_size", type=bool, default=True, help="对尺寸 L1 使用 log(w),log(h)（尺度更稳）",)
     parser.add_argument("--box_shape_gwd_weight", type=float, default=1.0, help="形状 GWD 权重（仅作用于 w,h,angle 的耦合项）",)
     parser.add_argument("--box_gwd_use_sqrt", type=bool, default=True, help="对 shape 的 W2^2 取 sqrt，使量纲更接近 L1（更易调参）",)
+
+    # 关系一致性损失（拓扑约束）：严格包含 / 角度同步 / 不合理重叠抑制
+    parser.add_argument("--relation_inside_weight", type=float, default=0.05, help="inside/contains 的严格包含损失权重（建议较小）",)
+    parser.add_argument("--relation_angle_align_weight", type=float, default=0.02, help="指定父子类别对的角度同步损失权重（建议较小）",)
+    parser.add_argument("--relation_repulsion_weight", type=float, default=0.01, help="不合理重叠/交叉（IoU）抑制损失权重（建议很小）",)
+    parser.add_argument("--relation_inside_predicates", type=str, default="inside", help="表示 subject inside object 的谓词名（逗号分隔）",)
+    parser.add_argument("--relation_contains_predicates", type=str, default="contains", help="表示 subject contains object 的谓词名（逗号分隔）",)
+    parser.add_argument("--relation_overlap_allowed_predicates", type=str, default="inside,contains", help="允许重叠的谓词名白名单（逗号分隔），其对象对将不参与 repulsion",)
+    parser.add_argument("--relation_angle_align_pairs", type=str, default="groundtrackfield:stadium", help="需要角度同步的类别对 child:parent（逗号分隔），为空则关闭",)
+    parser.add_argument("--relation_repulsion_iou_thr", type=float, default=0.1, help="repulsion 的 IoU 阈值（超过后才惩罚）",)
+    parser.add_argument("--relation_repulsion_aabb_prefilter_thr", type=float, default=0.02, help="repulsion 的 AABB 预筛阈值（越小越准但更慢）",)
+    parser.add_argument("--relation_repulsion_theta_eps", type=float, default=0.087, help="角度差小于该阈值时用 AABB 近似（弧度）",)
+    parser.add_argument("--relation_repulsion_apply_same_class", type=bool, default=True, help="是否对同类对象对启用 repulsion",)
+    parser.add_argument("--relation_repulsion_apply_diff_class", type=bool, default=True, help="是否对异类对象对启用 repulsion",)
+    parser.add_argument("--relation_repulsion_min_area", type=float, default=0.0, help="面积小于该阈值的框不参与 repulsion（归一化坐标）",)
+    parser.add_argument("--relation_repulsion_exempt_classes", type=str, default="", help="免疫 repulsion 的类别名（逗号分隔）",)
     
     parser.add_argument("--vae_loss_weight", type=float, default=0.1)
     parser.add_argument("--box_loss_weight", type=float, default=1.0)
@@ -235,8 +251,64 @@ class Trainer:
             constraint_class_ids=constraint_class_ids,
         )
         # 核心说明：
-        # - GWD 对长宽比/角度的耦合更敏感，可抑制“方形目标预测成长条”的平均化失败；
+        # - GWD 对长宽比/角度的耦合更敏感，可抑制“方形目标被预测成长条”的平均化失败；
         # - 保留原有 hinge 约束项（ratio/min_size），仅对异常框提供额外梯度，降低退化解风险。
+
+        def _names_to_pred_ids(names: str):
+            raw = [x.strip() for x in str(names).split(",") if x.strip()]
+            ids = []
+            for n in raw:
+                pid = self.vocab["pred_name_to_idx"].get(n, None)
+                if pid is None:
+                    self.logger.warning(f"[init] relation predicate name not found in vocab: {n}")
+                    continue
+                ids.append(int(pid))
+            return ids
+
+        def _names_to_obj_ids(names: str):
+            raw = [x.strip() for x in str(names).split(",") if x.strip()]
+            ids = []
+            for n in raw:
+                oid = self.vocab["object_name_to_idx"].get(n, None)
+                if oid is None:
+                    self.logger.warning(f"[init] relation object class name not found in vocab: {n}")
+                    continue
+                ids.append(int(oid))
+            return ids
+
+        def _parse_angle_pairs(pairs: str):
+            raw = [x.strip() for x in str(pairs).split(",") if x.strip()]
+            out = []
+            for item in raw:
+                if ":" not in item:
+                    self.logger.warning(f"[init] relation_angle_align_pairs invalid item (expect child:parent): {item}")
+                    continue
+                child_name, parent_name = [x.strip() for x in item.split(":", 1)]
+                if child_name == "" or parent_name == "":
+                    self.logger.warning(f"[init] relation_angle_align_pairs invalid item (empty): {item}")
+                    continue
+                c = self.vocab["object_name_to_idx"].get(child_name, None)
+                p = self.vocab["object_name_to_idx"].get(parent_name, None)
+                if c is None or p is None:
+                    self.logger.warning(f"[init] relation_angle_align_pairs name not found in vocab: {item}")
+                    continue
+                out.append((int(c), int(p)))
+            return out
+
+        self.rel_criterion = RelationConsistencyCriterion(
+            inside_pred_ids=_names_to_pred_ids(self.args.relation_inside_predicates),
+            contains_pred_ids=_names_to_pred_ids(self.args.relation_contains_predicates),
+            overlap_allowed_pred_ids=_names_to_pred_ids(self.args.relation_overlap_allowed_predicates),
+            angle_align_pairs=_parse_angle_pairs(self.args.relation_angle_align_pairs),
+            image_obj_idx=image_obj_idx,
+            repulsion_iou_thr=self.args.relation_repulsion_iou_thr,
+            repulsion_aabb_prefilter_thr=self.args.relation_repulsion_aabb_prefilter_thr,
+            repulsion_theta_eps=self.args.relation_repulsion_theta_eps,
+            repulsion_apply_same_class=bool(self.args.relation_repulsion_apply_same_class),
+            repulsion_apply_diff_class=bool(self.args.relation_repulsion_apply_diff_class),
+            repulsion_min_area=self.args.relation_repulsion_min_area,
+            repulsion_exempt_class_ids=_names_to_obj_ids(self.args.relation_repulsion_exempt_classes),
+        )
 
         lora_params = get_lora_parameters(self.unet)
         cma_params = get_cma_small_parameters(self.unet)
@@ -372,6 +444,10 @@ class Trainer:
         log_box_constraint_loss = 0.0
         log_vae_loss = 0.0
         log_diff_loss = 0.0
+        log_relation_inside = 0.0
+        log_relation_angle = 0.0
+        log_relation_repulsion = 0.0
+        log_relation_loss = 0.0
         if hasattr(self.train_dataloader, "sampler") and hasattr(self.train_dataloader.sampler, "set_epoch"):
             self.train_dataloader.sampler.set_epoch(epoch)
             self.logger.info(f"[epoch={epoch}] set train sampler epoch")
@@ -439,7 +515,28 @@ class Trainer:
                     box_constraint_pen = torch.tensor(0.0, device=pred_f.device, dtype=pred_f.dtype)
                 box_constraint_loss = box_constraint_pen * float(self.args.box_constraint_weight)
                 diff_loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                loss = box_loss * self.args.box_loss_weight + vae_loss * self.args.vae_loss_weight + diff_loss * self.args.diff_loss_weight
+
+                relation_inside = torch.tensor(0.0, device=layout_pred.device, dtype=layout_pred.dtype)
+                relation_angle = torch.tensor(0.0, device=layout_pred.device, dtype=layout_pred.dtype)
+                relation_repulsion = torch.tensor(0.0, device=layout_pred.device, dtype=layout_pred.dtype)
+                relation_loss = torch.tensor(0.0, device=layout_pred.device, dtype=layout_pred.dtype)
+                if (
+                    float(self.args.relation_inside_weight) != 0.0
+                    or float(self.args.relation_angle_align_weight) != 0.0
+                    or float(self.args.relation_repulsion_weight) != 0.0
+                ):
+                    rel_items = self.rel_criterion(layout_pred, objs, triples, obj_to_img, triple_to_img)
+                    relation_inside = rel_items["inside_violation"] * float(self.args.relation_inside_weight)
+                    relation_angle = rel_items["angle_align"] * float(self.args.relation_angle_align_weight)
+                    relation_repulsion = rel_items["repulsion"] * float(self.args.relation_repulsion_weight)
+                    relation_loss = relation_inside + relation_angle + relation_repulsion
+
+                loss = (
+                    box_loss * self.args.box_loss_weight
+                    + vae_loss * self.args.vae_loss_weight
+                    + diff_loss * self.args.diff_loss_weight
+                    + relation_loss
+                )
 
                 if not torch.isfinite(loss):
                     if self.accelerator.is_main_process:
@@ -457,6 +554,10 @@ class Trainer:
                 log_box_constraint_loss += self.gather_loss(box_constraint_loss)
                 log_vae_loss += self.gather_loss(vae_loss)
                 log_diff_loss += self.gather_loss(diff_loss)
+                log_relation_inside += self.gather_loss(relation_inside)
+                log_relation_angle += self.gather_loss(relation_angle)
+                log_relation_repulsion += self.gather_loss(relation_repulsion)
+                log_relation_loss += self.gather_loss(relation_loss)
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
@@ -486,6 +587,10 @@ class Trainer:
                 self.accelerator.log({"weighted_box_loss": log_box_loss * float(self.args.box_loss_weight)}, step=self.global_step)
                 self.accelerator.log({"weighted_vae_loss": log_vae_loss * float(self.args.vae_loss_weight)}, step=self.global_step)
                 self.accelerator.log({"weighted_diff_loss": log_diff_loss * float(self.args.diff_loss_weight)}, step=self.global_step)
+                self.accelerator.log({"relation_inside_loss": log_relation_inside}, step=self.global_step)
+                self.accelerator.log({"relation_angle_loss": log_relation_angle}, step=self.global_step)
+                self.accelerator.log({"relation_repulsion_loss": log_relation_repulsion}, step=self.global_step)
+                self.accelerator.log({"relation_loss": log_relation_loss}, step=self.global_step)
                 self.accelerator.log({"lr": self.lr_scheduler.get_last_lr()[0]}, step=self.global_step)
                 log_loss = 0.0
                 log_box_loss = 0.0
@@ -497,6 +602,10 @@ class Trainer:
                 log_box_constraint_loss = 0.0
                 log_vae_loss = 0.0
                 log_diff_loss = 0.0
+                log_relation_inside = 0.0
+                log_relation_angle = 0.0
+                log_relation_repulsion = 0.0
+                log_relation_loss = 0.0
 
                 logs = {"step_loss": '%.4f' % loss.detach().item(), "lr": '%.2e' % self.lr_scheduler.get_last_lr()[0]}
                 self.progress_bar.set_postfix(**logs)
