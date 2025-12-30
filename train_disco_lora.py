@@ -100,7 +100,7 @@ def parse_args():
     parser.add_argument("--relation_repulsion_weight", type=float, default=0.01, help="不合理重叠/交叉（IoU）抑制损失权重（建议很小）",)
     parser.add_argument("--relation_inside_predicates", type=str, default="inside", help="表示 subject inside object 的谓词名（逗号分隔）",)
     parser.add_argument("--relation_contains_predicates", type=str, default="contains", help="表示 subject contains object 的谓词名（逗号分隔）",)
-    parser.add_argument("--relation_overlap_allowed_predicates", type=str, default="inside,contains", help="允许重叠的谓词名白名单（逗号分隔），其对象对将不参与 repulsion",)
+    parser.add_argument("--relation_overlap_allowed_predicates", type=str, default="inside,operating_at", help="允许重叠的谓词名白名单（逗号分隔），其对象对将不参与 repulsion",)
     parser.add_argument("--relation_angle_align_pairs", type=str, default="groundtrackfield:stadium", help="需要角度同步的类别对 child:parent（逗号分隔），为空则关闭",)
     parser.add_argument("--relation_repulsion_iou_thr", type=float, default=0.1, help="repulsion 的 IoU 阈值（超过后才惩罚）",)
     parser.add_argument("--relation_repulsion_aabb_prefilter_thr", type=float, default=0.02, help="repulsion 的 AABB 预筛阈值（越小越准但更慢）",)
@@ -765,8 +765,6 @@ class Trainer:
                 if len(t) < 3:
                     continue
                 s_idx, p_idx, o_idx = int(t[0]), int(t[1]), int(t[2])
-                if image_idx is not None and (s_idx == image_idx or o_idx == image_idx):
-                    continue
                 if s_idx not in global_to_local or o_idx not in global_to_local:
                     continue
                 si = global_to_local[s_idx]
