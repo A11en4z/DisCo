@@ -45,9 +45,9 @@ from loss import VaeGaussCriterion, BoxL1Criterion
 #accelerate launch train_disco.py --use_ema --resolution=512 --batch_size=1 --gradient_accumulation_steps=4 --gradient_checkpointing --max_train_steps=50000 --learning_rate=1e-05  --lr_scheduler="linear" --checkpointing_steps 5000
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/data/stable-diffusion-v1-5', help="Path to pretrained model or model identifier from huggingface.co/models.",)
-    parser.add_argument('--data_dir', type=str, default='/data/VG_512', help='path to training dataset')
-    parser.add_argument('--output_dir', type=str, default="/data/results", help='path to save checkpoint')
+    parser.add_argument("--pretrained_diffusion_model_path", type=str, default='/inspire/hdd/global_user/yeziqi-240108100047/yxy/stable-diffusion-v1-5', help="Path to pretrained model or model identifier from huggingface.co/models.",)
+    parser.add_argument('--data_dir', type=str, default='/inspire/hdd/global_user/yeziqi-240108100047/yxy/vg', help='path to training dataset')
+    parser.add_argument('--output_dir', type=str, default="/inspire/hdd/global_user/yeziqi-240108100047/yxy/outputs", help='path to save checkpoint')
     parser.add_argument("--logging_dir", type=str, default="logs", help="TensorBoard log directory.")
 
     parser.add_argument('--dataloader_num_workers', type=int, default=8, help='num_workers')
@@ -514,7 +514,7 @@ class Trainer:
     def log_validation(self, step):
         box_mean_est, box_cov_est = self.sl_vae.collect_data_statistics(self.train_dataloader, self.accelerator.device)
         # 将 total 限制为 1000，显示与实际一致
-        max_val_images = 10
+        max_val_images = 32
         pbar = tqdm(self.val_dataloader, total=max_val_images, file=sys.stdout)
     
         pil_images = []
@@ -639,3 +639,6 @@ if __name__ == '__main__':
     # start training
     trainer = Trainer(args)
     trainer.start()
+    
+    
+# accelerate launch train_disco.py  --use_ema --resolution=512 --batch_size=4 --gradient_accumulation_steps=4 --gradient_checkpointing --max_train_steps=20000 --learning_rate=1e-05  --lr_scheduler="linear" --checkpointing_steps 1
